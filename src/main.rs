@@ -1,4 +1,5 @@
 mod app;
+mod browser;
 mod config;
 mod spotify;
 mod tags;
@@ -22,16 +23,8 @@ fn main() -> Result<()> {
 
     let mut terminal = ratatui::init();
     // Must happen after entering the alternate screen, before reading events.
-    let picker = if std::env::var("SONGOS_NOQUERY").is_ok() {
-        Picker::halfblocks()
-    } else {
-        Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks())
-    };
-    let mut app = App::new(cfg, picker);
-    if let Some(p) = direct {
-        app.direct = true;
-        app.load_song(p);
-    }
+    let picker = detect_picker();
+    let mut app = App::new(cfg, picker, direct);
 
     let res = (|| -> Result<()> {
         while !app.quit {
@@ -48,4 +41,29 @@ fn main() -> Result<()> {
     })();
     ratatui::restore();
     res
+}
+
+/// Probe the terminal for its image protocol and font size.
+///
+/// ratatui-image's probe gives up after 2s when the terminal never answers
+/// (e.g. inside tmux without passthrough) but leaves a thread blocked on stdin,
+/// which would swallow our first keypress. In that case we poke the terminal
+/// with a status request, whose reply is what that thread is waiting for.
+fn detect_picker() -> Picker {
+    use std::io::Write;
+    if std::env::var_os("SONGOS_NO_IMAGE_PROBE").is_some() {
+        return Picker::halfblocks();
+    }
+    let start = std::time::Instant::now();
+    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    if start.elapsed() >= Duration::from_millis(1900) {
+        let mut out = std::io::stdout();
+        let _ = out.write_all(b"\x1b[5n");
+        let _ = out.flush();
+        // discard anything that still leaks through as key events
+        while event::poll(Duration::from_millis(250)).unwrap_or(false) {
+            let _ = event::read();
+        }
+    }
+    picker
 }

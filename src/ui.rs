@@ -1,4 +1,5 @@
 use crate::app::*;
+use crate::browser::{ACTIONS, Mode, Popup, Sort};
 use crate::spotify::Track;
 use crate::tags::{Field, Tags};
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Position, Rect};
@@ -57,7 +58,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         crumbs.push(Span::styled("  ›  ", Style::new().fg(DIM)));
         crumbs.push(Span::styled(s, Style::new().fg(MUTED)));
     };
-    if app.screen != Screen::Home { push("Tag Management".into()); }
+    if app.screen == Screen::Browser { push(app.br.cwd.display().to_string()); }
+    else { push("Tag from Spotify".into()); }
     if matches!(app.screen, Screen::Search | Screen::Compare) {
         if let Some(p) = &app.path { push(p.file_name().unwrap_or_default().to_string_lossy().into_owned()); }
     }
@@ -65,8 +67,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(Line::from(crumbs)), head);
 
     match app.screen {
-        Screen::Home => home(f, body, app),
-        Screen::Pick => pick(f, body, app),
+        Screen::Browser => browser(f, body, app),
         Screen::Search => search(f, body, app),
         Screen::Compare => compare(f, body, app),
     }
@@ -76,8 +77,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Line::from(Span::styled(format!(" {msg}"), Style::new().fg(if *bad { BAD } else { ACCENT }).bold()))
     } else {
         match app.screen {
-            Screen::Home => key_hint(&[("↵", "open"), ("q", "quit")]),
-            Screen::Pick => key_hint(&[("type", "filter"), ("↑↓", "move"), ("↵", "select song"), ("esc", "back")]),
+            Screen::Browser => match (&app.br.popup, &app.br.mode) {
+                (Some(_), _) => key_hint(&[("↑↓", "move"), ("↵", "choose"), ("esc", "close")]),
+                (_, Mode::Goto { .. }) => key_hint(&[("type", "jump to match"), ("↵", "stay here"), ("esc", "cancel")]),
+                (_, Mode::Filter(_)) => key_hint(&[("type", "filter"), ("↵", "keep filter"), ("esc", "clear")]),
+                _ => key_hint(&[("↑↓", "move"), ("↵/l", "open"), ("h", "up"), ("s", "sort"), ("/", "go to"), ("n/N", "next/prev"), ("f", "filter"), (".", "hidden"), ("q", "quit")]),
+            },
             Screen::Search => match app.focus {
                 Focus::Input => key_hint(&[("↵", "search spotify"), ("↓", "results"), ("esc", "back")]),
                 Focus::Results => key_hint(&[("↑↓", "browse"), ("↵", "pick track"), ("tab", "edit query"), ("esc", "query")]),
@@ -93,78 +98,102 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(line), foot);
 }
 
-// ---------------------------------------------------------------- home
-fn home(f: &mut Frame, area: Rect, app: &App) {
-    let _ = app;
-    let logo = [
-        "███████╗ ██████╗ ███╗   ██╗ ██████╗  ██████╗ ███████╗",
-        "██╔════╝██╔═══██╗████╗  ██║██╔════╝ ██╔═══██╗██╔════╝",
-        "███████╗██║   ██║██╔██╗ ██║██║  ███╗██║   ██║███████╗",
-        "╚════██║██║   ██║██║╚██╗██║██║   ██║██║   ██║╚════██║",
-        "███████║╚██████╔╝██║ ╚████║╚██████╔╝╚██████╔╝███████║",
-        "╚══════╝ ╚═════╝ ╚═╝  ╚═══╝ ╚═════╝  ╚═════╝ ╚══════╝",
-    ];
-    let h = (logo.len() + 2 + 5) as u16;
-    let area = center_v(area, h);
-    let [l, _, m] = Layout::vertical([Constraint::Length(logo.len() as u16 + 1), Constraint::Length(1), Constraint::Length(5)]).areas(area);
-    let grad = [(29, 215, 96), (36, 205, 120), (44, 195, 145), (52, 185, 170), (60, 175, 195), (68, 165, 220)];
-    let mut lines: Vec<Line> = logo.iter().zip(grad).map(|(s, (r, g, b))| Line::from(Span::styled(*s, Style::new().fg(Color::Rgb(r, g, b))))).collect();
-    lines.push(Line::from(Span::styled("your music, properly tagged", Style::new().fg(MUTED).italic())));
-    f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), l);
-
-    let w = 44.min(m.width);
-    let menu = Rect { x: m.x + (m.width - w) / 2, width: w, ..m };
-    let item = Line::from(vec![
-        Span::styled(" ❯ ", Style::new().fg(ACCENT).bold()),
-        Span::styled("Tag Management", Style::new().fg(TEXT).bold()),
-    ]);
-    let sub = Line::from(Span::styled("     fix tags & cover art from Spotify", Style::new().fg(MUTED)));
-    f.render_widget(
-        Paragraph::new(vec![Line::raw(""), item, sub]).style(Style::new().bg(SEL_BG)).block(panel(title("Menu", true), true)),
-        menu,
-    );
-}
-
 fn center_v(area: Rect, h: u16) -> Rect {
     let h = h.min(area.height);
     Rect { y: area.y + (area.height - h) / 2, height: h, ..area }
 }
 
-// ---------------------------------------------------------------- pick
-fn pick(f: &mut Frame, area: Rect, app: &mut App) {
-    let [inp, list] = Layout::vertical([Constraint::Length(3), Constraint::Min(3)]).areas(area);
-    input_box(f, inp, "Find a song", &app.filter, true, "type to filter by path…");
+// ---------------------------------------------------------------- browser
+fn human(n: u64) -> String {
+    const U: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let (mut v, mut i) = (n as f64, 0);
+    while v >= 1024.0 && i < 4 { v /= 1024.0; i += 1; }
+    if i == 0 { format!("{n} B") } else { format!("{v:.1} {}", U[i]) }
+}
 
-    let files: Vec<String> = app.filtered_files().iter().map(|p| {
-        let rel = p.strip_prefix(&app.music_dir).unwrap_or(p).to_string_lossy().into_owned();
-        rel
-    }).collect();
-    let total = app.files.len();
-    let t = if app.scanning {
-        format!("{} Scanning {}", SPIN[app.tick / 2 % 10], app.music_dir.display())
-    } else {
-        format!("{} of {} songs · {}", files.len(), total, app.music_dir.display())
+fn browser(f: &mut Frame, area: Rect, app: &mut App) {
+    let br = &mut app.br;
+    let (list_area, bar) = match &br.mode {
+        Mode::Normal => (area, None),
+        _ => {
+            let [l, b] = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(area);
+            (l, Some(b))
+        }
     };
-    let w = list.width.saturating_sub(6) as usize;
-    let items: Vec<ListItem> = files.iter().map(|p| {
-        let (dir, name) = p.rsplit_once('/').unwrap_or(("", p.as_str()));
+
+    let inner_w = list_area.width.saturating_sub(5) as usize;
+    let (size_w, date_w) = (10usize, 16usize);
+    let name_w = inner_w.saturating_sub(size_w + date_w + 6);
+    let items: Vec<ListItem> = br.visible.iter().map(|&i| {
+        let e = &br.entries[i];
+        let (icon, style) = if e.is_dir { ("▸ ", Style::new().fg(ACCENT).bold()) }
+            else if e.audio { ("♪ ", Style::new().fg(TEXT)) }
+            else { ("· ", Style::new().fg(MUTED)) };
+        let name = if e.is_dir { format!("{}/", e.name) } else { e.name.clone() };
+        let date = e.modified.map(|m| chrono::DateTime::<chrono::Local>::from(m).format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default();
         ListItem::new(Line::from(vec![
-            Span::styled(trunc(name, w), Style::new().fg(TEXT)),
-            Span::styled(if dir.is_empty() { String::new() } else { format!("   {}", trunc(dir, w / 3)) }, Style::new().fg(MUTED)),
+            Span::styled(icon, if e.audio { Style::new().fg(ACCENT) } else { style }),
+            Span::styled(format!("{:<w$}", trunc(&name, name_w), w = name_w), style),
+            Span::styled(format!("  {:>w$}", if e.is_dir { "—".to_string() } else { human(e.size) }, w = size_w), Style::new().fg(MUTED)),
+            Span::styled(format!("  {date:>w$}", w = date_w), Style::new().fg(MUTED)),
         ]))
     }).collect();
+
+    let mut t = format!("{}", br.cwd.display());
+    t.push_str(&format!("  ·  {} items", br.visible.len()));
+    if !br.filter.is_empty() { t.push_str(&format!("  ·  filter “{}”", br.filter)); }
+    let block = panel(title(&t, true), true).title_bottom(Line::from(vec![
+        Span::styled(" sorted by ", Style::new().fg(DIM)),
+        Span::styled(format!("{} ", br.sort.label().split("  ").next().unwrap_or("")), Style::new().fg(MUTED)),
+    ]).right_aligned());
     let empty = items.is_empty();
-    let l = List::new(items)
-        .block(panel(title(&t, false), false))
-        .highlight_style(Style::new().bg(SEL_BG).bold())
-        .highlight_symbol("▍ ");
-    f.render_stateful_widget(l, list, &mut app.pick_list);
-    if empty && !app.scanning {
-        let msg = if total == 0 {
-            format!("No audio files in {}\nset \"music_dir\" in {}", app.music_dir.display(), crate::config::Config::path().display())
-        } else { "No matches".into() };
-        f.render_widget(Paragraph::new(msg).style(Style::new().fg(MUTED)).alignment(Alignment::Center), center_v(list.inner(Margin::new(1, 1)), 2));
+    let list = List::new(items).block(block).highlight_style(Style::new().bg(SEL_BG).bold()).highlight_symbol("▍");
+    f.render_stateful_widget(list, list_area, &mut br.list);
+    if empty {
+        let msg = br.error.clone().unwrap_or_else(|| if br.filter.is_empty() { "Empty folder".into() } else { "Nothing matches the filter".into() });
+        f.render_widget(Paragraph::new(msg).style(Style::new().fg(if br.error.is_some() { BAD } else { MUTED })).alignment(Alignment::Center),
+            center_v(list_area.inner(Margin::new(1, 1)), 1));
     }
+
+    match (&br.mode, bar) {
+        (Mode::Goto { input, .. }, Some(b)) => input_box(f, b, "Go to", input, true, "type part of a name…"),
+        (Mode::Filter(input), Some(b)) => input_box(f, b, "Filter", input, true, "type to hide non-matching…"),
+        _ => {}
+    }
+
+    // popups
+    match &mut br.popup {
+        Some(Popup::Sort(st)) => {
+            let items: Vec<ListItem> = Sort::ALL.iter().map(|s| {
+                let on = *s == br.sort;
+                ListItem::new(Line::from(vec![
+                    Span::styled(if on { "● " } else { "○ " }, Style::new().fg(if on { ACCENT } else { DIM })),
+                    Span::styled(s.label(), Style::new().fg(TEXT)),
+                ]))
+            }).collect();
+            popup(f, area, "Sort by", items, st, 40);
+        }
+        Some(Popup::Action(st, path)) => {
+            let items: Vec<ListItem> = ACTIONS.iter().map(|a| ListItem::new(Line::from(vec![
+                Span::styled("♪ ", Style::new().fg(ACCENT)), Span::styled(*a, Style::new().fg(TEXT)),
+            ]))).collect();
+            let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            popup(f, area, &trunc(&name, 38), items, st, 44);
+        }
+        None => {}
+    }
+}
+
+fn popup(f: &mut Frame, area: Rect, label: &str, items: Vec<ListItem>, st: &mut ListState, w: u16) {
+    let h = items.len() as u16 + 2;
+    let w = w.min(area.width);
+    let r = Rect { x: area.x + (area.width - w) / 2, y: area.y + area.height.saturating_sub(h) / 2, width: w, height: h.min(area.height) };
+    f.render_widget(Clear, r);
+    let l = List::new(items)
+        .block(panel(title(label, true), true))
+        .highlight_style(Style::new().bg(SEL_BG).bold())
+        .highlight_symbol("▍");
+    f.render_stateful_widget(l, r, st);
 }
 
 // ---------------------------------------------------------------- shared bits

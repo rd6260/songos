@@ -1,3 +1,4 @@
+use crate::browser::{Browser, Ev};
 use crate::config::Config;
 use crate::spotify::{Spotify, Track};
 use crate::tags::{self, Field, Tags};
@@ -12,12 +13,11 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 #[derive(PartialEq, Clone, Copy)]
-pub enum Screen { Home, Pick, Search, Compare }
+pub enum Screen { Browser, Search, Compare }
 #[derive(PartialEq, Clone, Copy)]
 pub enum Focus { Input, Results }
 
 pub enum Msg {
-    Files(Vec<PathBuf>),
     Search(u64, Result<Vec<Track>, String>),
     Preview(String, Option<DynamicImage>),
     Best(String, Result<(Vec<u8>, DynamicImage), String>),
@@ -92,14 +92,8 @@ pub struct App {
     pub picker: Picker,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
-    pub music_dir: PathBuf,
     pub screen: Screen,
-    pub direct: bool,
-
-    pub files: Vec<PathBuf>,
-    pub scanning: bool,
-    pub filter: Input,
-    pub pick_list: ListState,
+    pub br: Browser,
 
     pub path: Option<PathBuf>,
     pub current: Tags,
@@ -123,13 +117,12 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cfg: Config, picker: Picker) -> Self {
+    pub fn new(cfg: Config, picker: Picker, start: Option<PathBuf>) -> Self {
         let (tx, rx) = channel();
         Self {
             spotify: Arc::new(Spotify::new(cfg.spotify_client_id.clone(), cfg.spotify_client_secret.clone())),
-            picker, tx, rx, music_dir: cfg.music_dir(),
-            screen: Screen::Home, direct: false,
-            files: vec![], scanning: false, filter: Input::default(), pick_list: ListState::default(),
+            picker, tx, rx,
+            screen: Screen::Browser, br: Browser::new(start.unwrap_or_else(|| cfg.music_dir())),
             path: None, current: Tags::default(), current_proto: None, current_dims: None,
             query: Input::default(), focus: Focus::Input, results: vec![], list: ListState::default(),
             searching: false, search_seq: 0, searched: false,
@@ -145,7 +138,6 @@ impl App {
     pub fn pump(&mut self) {
         while let Ok(m) = self.rx.try_recv() {
             match m {
-                Msg::Files(f) => { self.files = f; self.scanning = false; self.pick_list.select(Some(0)); }
                 Msg::Search(seq, r) if seq == self.search_seq => {
                     self.searching = false;
                     self.searched = true;
@@ -203,62 +195,26 @@ impl App {
             return;
         }
         match self.screen {
-            Screen::Home => self.key_home(k),
-            Screen::Pick => self.key_pick(k),
+            Screen::Browser => self.key_browser(k),
             Screen::Search => self.key_search(k),
             Screen::Compare => self.key_compare(k),
         }
     }
 
-    fn key_home(&mut self, k: KeyEvent) {
-        match k.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
-            KeyCode::Enter => self.open_pick(),
-            _ => {}
-        }
-    }
-
-    pub fn open_pick(&mut self) {
-        self.screen = Screen::Pick;
+    fn key_browser(&mut self, k: KeyEvent) {
         self.status = None;
-        if self.files.is_empty() && !self.scanning {
-            self.scanning = true;
-            let (dir, tx) = (self.music_dir.clone(), self.tx.clone());
-            std::thread::spawn(move || {
-                let mut v: Vec<PathBuf> = walkdir::WalkDir::new(dir).into_iter().flatten()
-                    .filter(|e| e.file_type().is_file())
-                    .map(|e| e.into_path())
-                    .filter(|p| p.extension().and_then(|e| e.to_str()).is_some_and(|e|
-                        matches!(e.to_lowercase().as_str(), "mp3" | "flac" | "m4a" | "ogg" | "opus" | "wav" | "aac")))
-                    .collect();
-                v.sort();
-                let _ = tx.send(Msg::Files(v));
-            });
+        match self.br.key(k) {
+            Ev::None => {}
+            Ev::Quit => self.quit = true,
+            Ev::Tag(p) => self.load_song(p),
+            Ev::Status(m) => self.err(m),
         }
     }
 
-    pub fn filtered_files(&self) -> Vec<&PathBuf> {
-        let words: Vec<String> = self.filter.text.to_lowercase().split_whitespace().map(String::from).collect();
-        self.files.iter().filter(|p| {
-            let s = p.strip_prefix(&self.music_dir).unwrap_or(p).to_string_lossy().to_lowercase();
-            words.iter().all(|w| s.contains(w))
-        }).collect()
-    }
-
-    fn key_pick(&mut self, k: KeyEvent) {
-        let n = self.filtered_files().len();
-        let cur = self.pick_list.selected().unwrap_or(0);
-        match k.code {
-            KeyCode::Esc => self.screen = Screen::Home,
-            KeyCode::Down => self.pick_list.select(Some((cur + 1).min(n.saturating_sub(1)))),
-            KeyCode::Up => self.pick_list.select(Some(cur.saturating_sub(1))),
-            KeyCode::PageDown => self.pick_list.select(Some((cur + 10).min(n.saturating_sub(1)))),
-            KeyCode::PageUp => self.pick_list.select(Some(cur.saturating_sub(10))),
-            KeyCode::Enter => {
-                if let Some(p) = self.filtered_files().get(cur).map(|p| (*p).clone()) { self.load_song(p); }
-            }
-            _ => if self.filter.key(&k) { self.pick_list.select(Some(0)); },
-        }
+    fn back_to_browser(&mut self) {
+        self.status = None;
+        self.screen = Screen::Browser;
+        self.br.reload(None);
     }
 
     pub fn load_song(&mut self, path: PathBuf) {
@@ -285,7 +241,7 @@ impl App {
                 self.screen = Screen::Search;
             }
             Err(e) => {
-                self.screen = if self.direct { Screen::Home } else { Screen::Pick };
+                self.screen = Screen::Browser;
                 self.err(format!("Couldn't read tags: {e}"));
             }
         }
@@ -294,7 +250,7 @@ impl App {
     fn key_search(&mut self, k: KeyEvent) {
         match self.focus {
             Focus::Input => match k.code {
-                KeyCode::Esc => { self.status = None; self.screen = if self.direct { Screen::Home } else { Screen::Pick }; }
+                KeyCode::Esc => self.back_to_browser(),
                 KeyCode::Enter => self.search(),
                 KeyCode::Down | KeyCode::Tab if !self.results.is_empty() => { self.focus = Focus::Results; }
                 _ => { self.query.key(&k); }
