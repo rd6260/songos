@@ -44,8 +44,8 @@ pub enum Mode {
     Normal,
     /// `/` — jump to the first entry matching, without hiding anything.
     Goto { input: Input, origin: usize },
-    /// `f` — hide everything that doesn't match.
-    Filter(Input),
+    /// `f` — recursive find: lists every match in this folder and below.
+    Find(Input),
 }
 
 pub enum Popup {
@@ -102,6 +102,8 @@ pub struct Browser {
     /// Indices into `entries` that pass the filter.
     pub visible: Vec<usize>,
     pub list: ListState,
+    /// The browser never navigates above this directory.
+    pub root: PathBuf,
     pub sort: Sort,
     pub filter: String,
     pub show_hidden: bool,
@@ -123,13 +125,16 @@ fn is_audio(p: &Path) -> bool {
 }
 
 impl Browser {
-    pub fn new(start: PathBuf) -> Self {
+    pub fn new(start: PathBuf, root: PathBuf) -> Self {
         let (cwd, select) = if start.is_file() {
             (start.parent().map(Path::to_path_buf).unwrap_or_default(), start.file_name().map(|n| n.to_string_lossy().into_owned()))
         } else { (start, None) };
         let st = load_state();
+        // Stay inside the music dir; a start path outside it becomes its own root.
+        let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let root = if canon(&cwd).starts_with(canon(&root)) { root } else { cwd.clone() };
         let mut b = Self {
-            cwd, entries: vec![], visible: vec![], list: ListState::default(), sort: st.sort.unwrap_or(Sort::NameAsc),
+            root, cwd, entries: vec![], visible: vec![], list: ListState::default(), sort: st.sort.unwrap_or(Sort::NameAsc),
             filter: String::new(), show_hidden: false, mode: Mode::Normal, popup: None,
             last_goto: String::new(), error: None,
             layout: st.layout.unwrap_or_default(),
@@ -148,25 +153,41 @@ impl Browser {
         let select = select.or_else(|| self.selected().map(|e| e.name.clone()));
         self.error = None;
         self.entries.clear();
-        match std::fs::read_dir(&self.cwd) {
-            Ok(rd) => {
+        if self.filter.is_empty() {
+            match std::fs::read_dir(&self.cwd) {
+                Ok(rd) => for e in rd.flatten() { self.push_entry(e.path(), e.file_name().to_string_lossy().into_owned()); },
+                Err(e) => self.error = Some(format!("{}: {e}", self.cwd.display())),
+            }
+        } else {
+            // Find: walk everything below the current folder. Names are paths relative to it.
+            // Symlinked folders are listed but not descended into, so loops can't happen.
+            const CAP: usize = 200_000;
+            let mut stack = vec![self.cwd.clone()];
+            while let Some(dir) = stack.pop() {
+                let Ok(rd) = std::fs::read_dir(&dir) else { continue };
                 for e in rd.flatten() {
-                    let name = e.file_name().to_string_lossy().into_owned();
-                    if !self.show_hidden && name.starts_with('.') { continue; }
+                    if self.entries.len() >= CAP { break; }
+                    if !self.show_hidden && e.file_name().to_string_lossy().starts_with('.') { continue; }
                     let path = e.path();
-                    let md = std::fs::metadata(&path).ok(); // follows symlinks
-                    let is_dir = md.as_ref().is_some_and(|m| m.is_dir());
-                    self.entries.push(Entry {
-                        audio: !is_dir && is_audio(&path), is_dir, name, size: md.as_ref().map_or(0, |m| m.len()),
-                        modified: md.and_then(|m| m.modified().ok()), path,
-                    });
+                    let rel = path.strip_prefix(&self.cwd).unwrap_or(&path).to_string_lossy().into_owned();
+                    if e.file_type().is_ok_and(|t| t.is_dir()) { stack.push(path.clone()); }
+                    self.push_entry(path, rel);
                 }
             }
-            Err(e) => self.error = Some(format!("{}: {e}", self.cwd.display())),
         }
         self.sort_entries();
         self.refilter(select);
         self.spawn_meta();
+    }
+
+    fn push_entry(&mut self, path: PathBuf, name: String) {
+        if !self.show_hidden && name.starts_with('.') { return; }
+        let md = std::fs::metadata(&path).ok(); // follows symlinks
+        let is_dir = md.as_ref().is_some_and(|m| m.is_dir());
+        self.entries.push(Entry {
+            audio: !is_dir && is_audio(&path), is_dir, name, size: md.as_ref().map_or(0, |m| m.len()),
+            modified: md.and_then(|m| m.modified().ok()), path,
+        });
     }
 
     /// Read artist/title of this folder's audio files on a few worker threads.
@@ -257,6 +278,8 @@ impl Browser {
     }
 
     fn go_up(&mut self) {
+        let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        if canon(&self.cwd) == canon(&self.root) { return; }
         if let Some(parent) = self.cwd.parent().map(Path::to_path_buf) {
             let from = self.cwd.file_name().map(|n| n.to_string_lossy().into_owned());
             self.enter_dir(parent, from);
@@ -294,11 +317,16 @@ impl Browser {
                 }
                 Ev::None
             }
-            Mode::Filter(input) => {
+            Mode::Find(input) => {
                 match k.code {
-                    KeyCode::Esc => { self.filter.clear(); self.mode = Mode::Normal; self.refilter(None); }
+                    KeyCode::Esc => { self.filter.clear(); self.mode = Mode::Normal; self.reload(None); }
                     KeyCode::Enter => self.mode = Mode::Normal,
-                    _ => if input.key(&k) { self.filter = input.text.clone(); self.refilter(None); },
+                    _ => if input.key(&k) {
+                        let was_empty = self.filter.is_empty();
+                        self.filter = input.text.clone();
+                        // crossing empty <-> non-empty switches between folder listing and recursive walk
+                        if was_empty != self.filter.is_empty() { self.reload(None); } else { self.refilter(None); }
+                    },
                 }
                 Ev::None
             }
@@ -310,7 +338,7 @@ impl Browser {
         let page = 10;
         match k.code {
             KeyCode::Char('q') => return Ev::Quit,
-            KeyCode::Esc if !self.filter.is_empty() => { self.filter.clear(); self.refilter(None); }
+            KeyCode::Esc if !self.filter.is_empty() => { self.filter.clear(); self.reload(None); }
             KeyCode::Down | KeyCode::Char('j') => self.mv(1),
             KeyCode::Up | KeyCode::Char('k') => self.mv(-1),
             KeyCode::PageDown => self.mv(page),
@@ -353,7 +381,7 @@ impl Browser {
                     None => return Ev::Status(format!("No match for “{q}”")),
                 }
             }
-            KeyCode::Char('f') => self.mode = Mode::Filter(Input::new(&self.filter)),
+            KeyCode::Char('f') => self.mode = Mode::Find(Input::new(&self.filter)),
             KeyCode::Char('.') => { self.show_hidden = !self.show_hidden; self.reload(None); }
             KeyCode::Char('P') | KeyCode::Char('p') => {
                 self.layout = if self.layout == Layout::Clean { Layout::Detailed } else { Layout::Clean };

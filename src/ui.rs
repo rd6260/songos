@@ -63,7 +63,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         push(app.br.cwd.display().to_string());
         if app.br.layout == BrowserLayout::Clean {
             push(format!("{} items", app.br.visible.len()));
-            if !app.br.filter.is_empty() { push(format!("filter “{}”", app.br.filter)); }
+            if !app.br.filter.is_empty() { push(format!("find “{}”", app.br.filter)); }
         }
     }
     else { push("Tag from Spotify".into()); }
@@ -87,8 +87,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             Screen::Browser => match (&app.br.popup, &app.br.mode) {
                 (Some(_), _) => key_hint(&[("↑↓", "move"), ("↵", "choose"), ("esc", "close")]),
                 (_, Mode::Goto { .. }) => key_hint(&[("type", "jump to match"), ("↵", "stay here"), ("esc", "cancel")]),
-                (_, Mode::Filter(_)) => key_hint(&[("type", "filter"), ("↵", "keep filter"), ("esc", "clear")]),
-                _ => key_hint(&[("↑↓", "move"), ("↵/l", "open"), ("h", "up"), ("s", "sort"), ("/", "go to"), ("n/N", "next/prev"), ("f", "filter"), ("P", "layout"), ("u", "refresh"), (".", "hidden"), ("q", "quit")]),
+                (_, Mode::Find(_)) => key_hint(&[("type", "find in this folder and below"), ("↵", "keep results"), ("esc", "clear")]),
+                _ => key_hint(&[("↑↓", "move"), ("↵/l", "open"), ("h", "up"), ("s", "sort"), ("/", "go to"), ("n/N", "next/prev"), ("f", "find"), ("P", "layout"), ("u", "refresh"), (".", "hidden"), ("q", "quit")]),
             },
             Screen::Search => match app.focus {
                 Focus::Input => key_hint(&[("↵", "search spotify"), ("↓", "results"), ("esc", "back")]),
@@ -170,7 +170,7 @@ fn browser(f: &mut Frame, area: Rect, app: &mut App) {
 
             let mut t = format!("{}", br.cwd.display());
             t.push_str(&format!("  ·  {} items", br.visible.len()));
-            if !br.filter.is_empty() { t.push_str(&format!("  ·  filter “{}”", br.filter)); }
+            if !br.filter.is_empty() { t.push_str(&format!("  ·  find “{}”", br.filter)); }
             let block = panel(title(&t, true), true).title_bottom(Line::from(vec![
                 Span::styled(" sorted by ", Style::new().fg(DIM)),
                 Span::styled(format!("{} ", br.sort.label().split("  ").next().unwrap_or("")), Style::new().fg(MUTED)),
@@ -219,14 +219,14 @@ fn browser(f: &mut Frame, area: Rect, app: &mut App) {
         }
     }
     if empty {
-        let msg = br.error.clone().unwrap_or_else(|| if br.filter.is_empty() { "Empty folder".into() } else { "Nothing matches the filter".into() });
+        let msg = br.error.clone().unwrap_or_else(|| if br.filter.is_empty() { "Empty folder".into() } else { "Nothing found".into() });
         f.render_widget(Paragraph::new(msg).style(Style::new().fg(if br.error.is_some() { BAD } else { MUTED })).alignment(Alignment::Center),
             center_v(list_area.inner(Margin::new(1, 1)), 1));
     }
 
     match (&br.mode, bar) {
         (Mode::Goto { input, .. }, Some(b)) => input_box(f, b, "Go to", input, true, "type part of a name…"),
-        (Mode::Filter(input), Some(b)) => input_box(f, b, "Filter", input, true, "type to hide non-matching…"),
+        (Mode::Find(input), Some(b)) => input_box(f, b, "Find", input, true, "search this folder and everything below…"),
         _ => {}
     }
 

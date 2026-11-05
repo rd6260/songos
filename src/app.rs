@@ -168,7 +168,7 @@ impl App {
         Self {
             spotify: Arc::new(Spotify::new(cfg.spotify_client_id.clone(), cfg.spotify_client_secret.clone())),
             picker, tx, rx,
-            screen: Screen::Browser, br: Browser::new(start.unwrap_or_else(|| cfg.music_dir())),
+            screen: Screen::Browser, br: Browser::new(start.unwrap_or_else(|| cfg.music_dir()), cfg.music_dir()),
             path: None, current: Tags::default(), current_proto: None, current_dims: None,
             query: Input::default(), focus: Focus::Input, results: vec![], list: ListState::default(),
             searching: false, search_seq: 0, searched: false,

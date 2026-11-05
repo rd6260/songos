@@ -9,7 +9,7 @@ Browse your files like a normal file manager, pick a song, search Spotify for it
 - **File-manager home screen** with two layouts you can flip between with `P`:
   - *Detailed*: bordered table with name, size and modified date.
   - *Clean*: borderless, artist on the left and title on the right, plus a side panel with the cover and tags of the song under the cursor.
-- Sort popup (name, modified, size, type), `/` to jump to a match, `f` to filter. Your sort order and layout are remembered.
+- Sort popup (name, modified, size, type), `/` to jump to a match, `f` to find (recursive search below the current folder). Your sort order and layout are remembered.
 - **Spotify search** prefilled from the file's existing tags, with album art and track info for every result, including runtime next to the local file's runtime so you can tell when you've matched the wrong version.
 - **Review screen**: current tags on top, new tags below. Edit any field, choose whether to replace the cover, and rename the file (with a one-key `ARTIST - TITLE` toggle).
 - Saves in the background with a progress indicator and a confirmation step first.
@@ -83,13 +83,13 @@ Select a song, press `Enter`, choose **Tag from Spotify**, press `Enter` to sear
 | `h` / `←` / `Backspace` | Parent folder |
 | `s` | Sort menu |
 | `/` | Jump to the first match (nothing is hidden); `n` / `N` for next / previous |
-| `f` | Filter (hides non-matches); `Esc` clears it |
+| `f` | Find: recursive search of this folder and everything below; `Enter` keeps the results, `Esc` clears them |
 | `P` | Toggle detailed / clean layout |
 | `u` | Refresh / rescan |
 | `.` | Show / hide hidden files |
 | `q` | Quit |
 
-`/` and `f` match the file name and, once loaded, the artist and title.
+`/` and `f` match the file name (for `f`, the path relative to the current folder) and, once loaded, the artist and title.
 
 ### Spotify search
 
