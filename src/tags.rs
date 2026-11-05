@@ -35,6 +35,7 @@ impl Field {
 pub struct Tags {
     pub values: [String; 9],
     pub cover: Option<Vec<u8>>,
+    pub duration_ms: u64,
 }
 
 impl Tags {
@@ -48,6 +49,7 @@ pub fn idx(f: Field) -> usize { Field::ALL.iter().position(|x| *x == f).unwrap()
 pub fn read(path: &Path) -> Result<Tags> {
     let tf = lofty::read_from_path(path)?;
     let mut t = Tags::default();
+    t.duration_ms = tf.properties().duration().as_millis() as u64;
     let Some(tag) = tf.primary_tag().or_else(|| tf.first_tag()) else { return Ok(t) };
     for f in Field::ALL {
         if let Some(v) = tag.get_string(f.key()) { t.set(f, v.to_string()); }

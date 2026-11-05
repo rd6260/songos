@@ -3075,6 +3075,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "unicode-width",
 ]
 
 [[package]]

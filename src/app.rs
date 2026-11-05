@@ -20,6 +20,7 @@ pub enum Focus { Input, Results }
 pub enum Msg {
     Search(u64, Result<Vec<Track>, String>),
     Preview(String, Option<DynamicImage>),
+    Saved(Result<PathBuf, String>),
     Best(String, Result<(Vec<u8>, DynamicImage), String>),
 }
 
@@ -71,6 +72,30 @@ impl Input {
 pub const COVER_ROW: usize = 9;
 /// Rows in the left column of the compare grid; the rest are in the right one.
 pub const LEFT_ROWS: usize = 5;
+/// Button "rows" below the grid in the review view.
+/// Full-width filename row under the grid.
+pub const FILE_ROW: usize = 10;
+pub const SAVE_BTN: usize = 11;
+pub const CANCEL_BTN: usize = 12;
+/// "Use ARTIST - TITLE" button at the right end of the filename row.
+pub const FORMAT_BTN: usize = 13;
+
+impl Compare {
+    /// Filename currently equals the standard "ALBUM ARTIST - TITLE.ext".
+    pub fn is_standard(&self) -> bool { self.filename == standard_name(self) }
+
+    /// On: remember the current name and switch to the standard one. Off: restore it.
+    pub fn toggle_standard(&mut self) {
+        if self.is_standard() {
+            self.filename = std::mem::take(&mut self.prev_filename);
+        } else {
+            self.prev_filename = self.filename.clone();
+            self.filename = standard_name(self);
+        }
+    }
+    /// Cover is wanted but hasn't finished downloading yet.
+    pub fn cover_pending(&self) -> bool { self.apply_cover && self.cover_bytes.is_none() && self.cover_err.is_none() }
+}
 
 pub struct Compare {
     pub track: Track,
@@ -79,8 +104,17 @@ pub struct Compare {
     pub edited: [bool; 9],
     pub sel: usize,
     pub editing: Option<Input>,
+    /// Set while the file is being written (drives the progress overlay).
+    pub saving: Option<std::time::Instant>,
+    /// y/n popup shown before writing.
     pub confirm: bool,
+    /// Last grid row selected, so ↑ from the filename row returns to the same column.
+    pub last_grid: usize,
     pub apply_cover: bool,
+    pub filename: String,
+    pub orig_filename: String,
+    /// Name to restore when the standard-name toggle is switched off.
+    pub prev_filename: String,
     pub cover_bytes: Option<Vec<u8>>,
     pub cover_dims: Option<(u32, u32)>,
     pub cover_proto: Option<StatefulProtocol>,
@@ -136,6 +170,7 @@ impl App {
 
     // ---------- background messages ----------
     pub fn pump(&mut self) {
+        self.br.poll_meta();
         while let Ok(m) = self.rx.try_recv() {
             match m {
                 Msg::Search(seq, r) if seq == self.search_seq => {
@@ -152,6 +187,20 @@ impl App {
                         Err(e) => self.err(e),
                     }
                 }
+                Msg::Saved(r) => match r {
+                    Ok(new_path) => {
+                        let name = file_name(Some(&new_path));
+                        self.path = Some(new_path);
+                        self.cmp = None;
+                        self.screen = Screen::Browser;
+                        self.br.reload(Some(name.clone()));
+                        self.ok(format!("Saved ✓  {name}"));
+                    }
+                    Err(e) => {
+                        if let Some(c) = self.cmp.as_mut() { c.saving = None; }
+                        self.err(format!("Write failed: {e}"));
+                    }
+                },
                 Msg::Search(..) => {}
                 Msg::Preview(url, img) => {
                     self.pending.remove(&url);
@@ -190,6 +239,8 @@ impl App {
 
     // ---------- keys ----------
     pub fn key(&mut self, k: KeyEvent) {
+        // Don't let anything interrupt a write in progress.
+        if self.cmp.as_ref().is_some_and(|c| c.saving.is_some()) { return; }
         if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
             self.quit = true;
             return;
@@ -208,6 +259,7 @@ impl App {
             Ev::Quit => self.quit = true,
             Ev::Tag(p) => self.load_song(p),
             Ev::Status(m) => self.err(m),
+            Ev::Info(m) => self.ok(m),
         }
     }
 
@@ -260,7 +312,7 @@ impl App {
                 match k.code {
                     KeyCode::Esc | KeyCode::Tab | KeyCode::Char('/') => self.focus = Focus::Input,
                     KeyCode::Up | KeyCode::Char('k') => {
-                        if cur == 0 { self.focus = Focus::Input } else { self.list.select(Some(cur - 1)) }
+                        self.list.select(Some(cur.saturating_sub(1)));
                     }
                     KeyCode::Down | KeyCode::Char('j') => self.list.select(Some((cur + 1).min(self.results.len() - 1))),
                     KeyCode::Enter => self.open_compare(),
@@ -316,7 +368,8 @@ impl App {
         }
         self.cmp = Some(Compare {
             apply_cover: track.cover_url.is_some(),
-            track, spotify: sp, new, edited: [false; 9], sel: 0, editing: None, confirm: false,
+            filename: file_name(self.path.as_deref()), orig_filename: file_name(self.path.as_deref()), prev_filename: file_name(self.path.as_deref()),
+            track, spotify: sp, new, edited: [false; 9], sel: 0, editing: None, saving: None, confirm: false, last_grid: 0,
             cover_bytes: None, cover_dims: None, cover_proto: None, cover_err: None,
         });
         self.status = None;
@@ -324,76 +377,153 @@ impl App {
     }
 
     fn key_compare(&mut self, k: KeyEvent) {
-        let mut save = false;
+        enum Act { None, Save, Cancel }
+        let mut act = Act::None;
+        let changes = self.change_count();
+        let mut warn = None;
         {
             let Some(c) = self.cmp.as_mut() else { return };
             if c.confirm {
                 match k.code {
-                    KeyCode::Char('y') | KeyCode::Enter => save = true,
-                    _ => c.confirm = false,
+                    KeyCode::Char('y') | KeyCode::Char('Y') => { c.confirm = false; act = Act::Save; }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => c.confirm = false,
+                    _ => {}
                 }
             } else if let Some(inp) = c.editing.as_mut() {
                 match k.code {
+                    KeyCode::Enter if c.sel == FILE_ROW => {
+                        let stem = inp.text.trim();
+                        if stem.is_empty() || stem == "." || stem == ".." || stem.contains(['/', '\0']) {
+                            self.status = Some(("Filename can't be empty or contain “/”".into(), true));
+                        } else {
+                            c.filename = format!("{stem}{}", ext_of(&c.orig_filename));
+                            c.editing = None;
+                            self.status = None;
+                        }
+                    }
                     KeyCode::Enter => {
                         let f = Field::ALL[c.sel];
                         c.new.set(f, inp.text.trim().to_string());
                         c.edited[c.sel] = true;
                         c.editing = None;
                     }
-                    KeyCode::Esc => c.editing = None,
+                    KeyCode::Esc => { c.editing = None; self.status = None; }
                     _ => { inp.key(&k); }
                 }
             } else {
                 match k.code {
+                    // back to the search results to pick a different track
                     KeyCode::Esc => { self.screen = Screen::Search; self.cmp = None; return; }
-                    KeyCode::Down | KeyCode::Char('j') => c.sel = (c.sel + 1).min(COVER_ROW),
-                    KeyCode::Up | KeyCode::Char('k') => c.sel = c.sel.saturating_sub(1),
+                    // Columns are independent: ↓ past the last row of either one goes to the filename row.
+                    KeyCode::Down | KeyCode::Char('j') => c.sel = match c.sel {
+                        SAVE_BTN | CANCEL_BTN => c.sel,
+                        FILE_ROW | FORMAT_BTN => SAVE_BTN,
+                        s if s == LEFT_ROWS - 1 || s == COVER_ROW => { c.last_grid = s; FILE_ROW }
+                        s => s + 1,
+                    },
+                    KeyCode::Up | KeyCode::Char('k') => c.sel = match c.sel {
+                        SAVE_BTN | CANCEL_BTN => FILE_ROW,
+                        FILE_ROW | FORMAT_BTN => c.last_grid,
+                        s if s == 0 || s == LEFT_ROWS => s,
+                        s => s - 1,
+                    },
                     KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') | KeyCode::Tab => {
-                        c.sel = if c.sel < LEFT_ROWS { c.sel + LEFT_ROWS } else { c.sel - LEFT_ROWS };
+                        let right = matches!(k.code, KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab);
+                        c.sel = match c.sel {
+                            FILE_ROW => if right { FORMAT_BTN } else { FILE_ROW },
+                            FORMAT_BTN => if right { FORMAT_BTN } else { FILE_ROW },
+                            SAVE_BTN => CANCEL_BTN,
+                            CANCEL_BTN => SAVE_BTN,
+                            s if s < LEFT_ROWS => s + LEFT_ROWS,
+                            s => s - LEFT_ROWS,
+                        };
                     }
-                    KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char(' ') => {
-                        if c.sel == COVER_ROW {
-                            c.apply_cover = !c.apply_cover && c.cover_bytes.is_some();
-                        } else {
-                            c.editing = Some(Input::new(c.new.get(Field::ALL[c.sel])));
-                        }
-                    }
+                    KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char(' ') => match c.sel {
+                        SAVE_BTN => if changes == 0 { warn = Some("Nothing to save — no changes") } else if c.cover_pending() { warn = Some("Cover art is still downloading — try again in a moment") } else { c.confirm = true },
+                        CANCEL_BTN => act = Act::Cancel,
+                        COVER_ROW => c.apply_cover = !c.apply_cover && c.cover_bytes.is_some(),
+                        FILE_ROW => c.editing = Some(Input::new(stem_of(&c.filename))),
+                        FORMAT_BTN => c.toggle_standard(),
+                        _ => c.editing = Some(Input::new(c.new.get(Field::ALL[c.sel]))),
+                    },
+                    KeyCode::Char('r') if c.sel == FILE_ROW => c.toggle_standard(),
                     // reset to the Spotify value
                     KeyCode::Char('r') if c.sel < COVER_ROW => {
                         let f = Field::ALL[c.sel];
                         c.new.set(f, c.spotify.get(f).to_string());
                         c.edited[c.sel] = false;
                     }
-                    // keep what the file has now
-                    KeyCode::Char('c') | KeyCode::Char('x') if c.sel < COVER_ROW => {
-                        let f = Field::ALL[c.sel];
-                        c.new.set(f, self.current.get(f).to_string());
-                        c.edited[c.sel] = true;
-                    }
-                    KeyCode::Char('w') | KeyCode::Char('s') => c.confirm = true,
+                    KeyCode::Char('s') => if changes == 0 { warn = Some("Nothing to save — no changes") } else if c.cover_pending() { warn = Some("Cover art is still downloading — try again in a moment") } else { c.confirm = true },
                     _ => {}
                 }
             }
         }
-        if save { self.save(); }
+        if let Some(w) = warn { self.err(w); }
+        match act {
+            Act::Save => self.save(),
+            Act::Cancel => {
+                self.cmp = None;
+                self.back_to_browser();
+            }
+            Act::None => {}
+        }
     }
 
     pub fn change_count(&self) -> usize {
         let Some(c) = &self.cmp else { return 0 };
-        Field::ALL.iter().filter(|f| c.new.get(**f) != self.current.get(**f)).count() + c.apply_cover as usize
+        Field::ALL.iter().filter(|f| c.new.get(**f) != self.current.get(**f)).count() + (c.apply_cover && c.cover_bytes.is_some()) as usize + (c.filename != c.orig_filename) as usize
     }
 
+    /// Write on a worker thread so the UI can show progress (big FLACs are rewritten in full).
     fn save(&mut self) {
-        let (Some(c), Some(path)) = (self.cmp.as_mut(), self.path.clone()) else { return };
-        c.confirm = false;
-        let cover = if c.apply_cover { c.cover_bytes.clone() } else { None };
-        match tags::write(&path, &c.new, cover.as_deref()) {
-            Ok(()) => {
-                self.cmp = None;
-                self.load_song(path);
-                self.ok("Saved ✓  tags written to file");
-            }
-            Err(e) => self.err(format!("Write failed: {e}")),
+        if self.change_count() == 0 {
+            self.err("Nothing to save — no changes");
+            return;
         }
+        let (Some(c), Some(path)) = (self.cmp.as_mut(), self.path.clone()) else { return };
+        let cover = if c.apply_cover { c.cover_bytes.clone() } else { None };
+        let new = c.new.clone();
+        let new_path = path.with_file_name(&c.filename);
+        if c.filename != c.orig_filename && new_path.exists() {
+            let msg = format!("“{}” already exists in this folder", c.filename);
+            self.status = Some((msg, true));
+            return;
+        }
+        c.saving = Some(std::time::Instant::now());
+        self.status = None;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let r = tags::write(&path, &new, cover.as_deref()).map_err(|e| format!("{e:#}")).and_then(|()| {
+                if new_path != path {
+                    std::fs::rename(&path, &new_path).map_err(|e| format!("tags saved, but renaming failed: {e}"))?;
+                }
+                Ok(new_path)
+            });
+            let _ = tx.send(Msg::Saved(r));
+        });
     }
+}
+
+fn file_name(p: Option<&std::path::Path>) -> String {
+    p.and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// ".flac" (with the dot), or "" when there is none.
+fn ext_of(name: &str) -> String {
+    std::path::Path::new(name).extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default()
+}
+
+fn stem_of(name: &str) -> &str {
+    std::path::Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or(name)
+}
+
+/// "ALBUM ARTIST - TITLE.ext" from the new tags (falls back to the track artist),
+/// with characters filesystems dislike replaced.
+pub fn standard_name(c: &Compare) -> String {
+    let who = match c.new.get(Field::AlbumArtist) { "" => c.new.get(Field::Artist), a => a };
+    let base = format!("{who} - {}", c.new.get(Field::Title));
+    let base: String = base.chars()
+        .map(|ch| if matches!(ch, '/' | '\\' | '\0' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { ch })
+        .collect();
+    format!("{}{}", base.trim(), ext_of(&c.orig_filename))
 }

@@ -15,7 +15,6 @@ pub struct Track {
     pub total_tracks: u32,
     pub duration_ms: u64,
     pub isrc: Option<String>,
-    pub popularity: u32,
     pub explicit: bool,
     /// Largest cover advertised by the API (usually 640x640).
     pub cover_url: Option<String>,
@@ -40,7 +39,6 @@ struct Item {
     #[serde(default)] track_number: u32,
     #[serde(default)] disc_number: u32,
     #[serde(default)] duration_ms: u64,
-    #[serde(default)] popularity: u32,
     #[serde(default)] explicit: bool,
     external_ids: Option<Ext>,
 }
@@ -123,7 +121,6 @@ impl Spotify {
                 total_tracks: i.album.total_tracks,
                 duration_ms: i.duration_ms,
                 isrc: i.external_ids.and_then(|e| e.isrc),
-                popularity: i.popularity,
                 explicit: i.explicit,
                 cover_px: best.and_then(|b| b.width).unwrap_or(0),
                 cover_url: best.map(|b| b.url.clone()),

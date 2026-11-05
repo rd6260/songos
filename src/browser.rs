@@ -1,7 +1,10 @@
 use crate::app::Input;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 pub struct Entry {
@@ -13,7 +16,7 @@ pub struct Entry {
     pub modified: Option<SystemTime>,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Sort { NameAsc, NameDesc, ModifiedNew, ModifiedOld, SizeBig, SizeSmall, Type }
 
 impl Sort {
@@ -26,6 +29,15 @@ impl Sort {
             Sort::Type => "Type  (extension)",
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub enum Layout {
+    /// Bordered table: icon, name, size, modified.
+    #[default]
+    Detailed,
+    /// Borderless: artist on the left, title on the right.
+    Clean,
 }
 
 pub enum Mode {
@@ -41,9 +53,48 @@ pub enum Popup {
     Action(ListState, PathBuf),
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct State {
+    #[serde(default)] sort: Option<Sort>,
+    #[serde(default)] layout: Option<Layout>,
+}
+
+fn state_path() -> PathBuf {
+    dirs::config_dir().unwrap_or_default().join("songos/state.json")
+}
+
+fn load_state() -> State {
+    std::fs::read_to_string(state_path()).ok()
+        .and_then(|s| serde_json::from_str::<State>(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Best effort: a failure to remember the view shouldn't bother anyone.
+fn save_state(sort: Sort, layout: Layout) {
+    let p = state_path();
+    if let Some(dir) = p.parent() { let _ = std::fs::create_dir_all(dir); }
+    let st = State { sort: Some(sort), layout: Some(layout) };
+    if let Ok(json) = serde_json::to_string_pretty(&st) { let _ = std::fs::write(p, json); }
+}
+
+/// (artist, title) read from a file's tags; empty strings when absent.
+pub type Meta = (String, String);
+
+fn read_meta(path: &Path) -> Meta {
+    use lofty::config::ParseOptions;
+    use lofty::file::TaggedFileExt;
+    use lofty::probe::Probe;
+    use lofty::tag::ItemKey;
+    let Ok(probe) = Probe::open(path) else { return Meta::default() };
+    let Ok(tf) = probe.options(ParseOptions::new().read_properties(false)).read() else { return Meta::default() };
+    let Some(tag) = tf.primary_tag().or_else(|| tf.first_tag()) else { return Meta::default() };
+    let get = |k: ItemKey| tag.get_string(k).unwrap_or_default().trim().to_string();
+    (get(ItemKey::TrackArtist), get(ItemKey::TrackTitle))
+}
+
 pub const ACTIONS: [&str; 1] = ["Tag from Spotify"];
 
-pub enum Ev { None, Quit, Tag(PathBuf), Status(String) }
+pub enum Ev { None, Quit, Tag(PathBuf), Status(String), Info(String) }
 
 pub struct Browser {
     pub cwd: PathBuf,
@@ -58,6 +109,12 @@ pub struct Browser {
     pub popup: Option<Popup>,
     pub last_goto: String,
     pub error: Option<String>,
+    pub layout: Layout,
+    /// Tags of the files seen so far, filled in by background threads (clean layout).
+    pub meta: Arc<Mutex<HashMap<PathBuf, Meta>>>,
+    meta_gen: Arc<AtomicU64>,
+    meta_done: Arc<AtomicUsize>,
+    meta_seen: usize,
 }
 
 fn is_audio(p: &Path) -> bool {
@@ -70,10 +127,13 @@ impl Browser {
         let (cwd, select) = if start.is_file() {
             (start.parent().map(Path::to_path_buf).unwrap_or_default(), start.file_name().map(|n| n.to_string_lossy().into_owned()))
         } else { (start, None) };
+        let st = load_state();
         let mut b = Self {
-            cwd, entries: vec![], visible: vec![], list: ListState::default(), sort: Sort::NameAsc,
+            cwd, entries: vec![], visible: vec![], list: ListState::default(), sort: st.sort.unwrap_or(Sort::NameAsc),
             filter: String::new(), show_hidden: false, mode: Mode::Normal, popup: None,
             last_goto: String::new(), error: None,
+            layout: st.layout.unwrap_or_default(),
+            meta: Arc::default(), meta_gen: Arc::default(), meta_done: Arc::default(), meta_seen: 0,
         };
         b.reload(select);
         b
@@ -106,6 +166,53 @@ impl Browser {
         }
         self.sort_entries();
         self.refilter(select);
+        self.spawn_meta();
+    }
+
+    /// Read artist/title of this folder's audio files on a few worker threads.
+    /// A newer call (new folder, refresh) makes older workers stop early.
+    fn spawn_meta(&mut self) {
+        let epoch = self.meta_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.layout != Layout::Clean { return; }
+        let todo: Vec<PathBuf> = {
+            let cache = self.meta.lock().unwrap();
+            self.entries.iter().filter(|e| e.audio && !cache.contains_key(&e.path)).map(|e| e.path.clone()).collect()
+        };
+        let workers = 4;
+        for w in 0..workers {
+            let mine: Vec<PathBuf> = todo.iter().skip(w).step_by(workers).cloned().collect();
+            let (cache, g, done) = (self.meta.clone(), self.meta_gen.clone(), self.meta_done.clone());
+            std::thread::spawn(move || {
+                for p in mine {
+                    if g.load(Ordering::SeqCst) != epoch { return; }
+                    let m = read_meta(&p);
+                    cache.lock().unwrap().insert(p, m);
+                    done.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        }
+    }
+
+    /// Called every frame: when new tags arrived, re-apply the filter so it can match them.
+    pub fn poll_meta(&mut self) {
+        let done = self.meta_done.load(Ordering::SeqCst);
+        if done != self.meta_seen {
+            self.meta_seen = done;
+            if !self.filter.is_empty() {
+                let keep = self.selected().map(|e| e.name.clone());
+                self.refilter(keep);
+            }
+        }
+    }
+
+    /// Lower-cased text that `/` and `f` match against: file name plus artist and title.
+    fn haystack(&self, e: &Entry) -> String {
+        let mut h = e.name.to_lowercase();
+        if let Some((a, t)) = self.meta.lock().unwrap().get(&e.path) {
+            h.push(' '); h.push_str(&a.to_lowercase());
+            h.push(' '); h.push_str(&t.to_lowercase());
+        }
+        h
     }
 
     fn sort_entries(&mut self) {
@@ -134,7 +241,7 @@ impl Browser {
     fn refilter(&mut self, select: Option<String>) {
         let words: Vec<String> = self.filter.to_lowercase().split_whitespace().map(String::from).collect();
         self.visible = (0..self.entries.len()).filter(|&i| {
-            let n = self.entries[i].name.to_lowercase();
+            let n = self.haystack(&self.entries[i]);
             words.iter().all(|w| n.contains(w))
         }).collect();
         let pos = select.and_then(|s| self.visible.iter().position(|&i| self.entries[i].name == s));
@@ -168,7 +275,7 @@ impl Browser {
         if n == 0 || q.is_empty() { return None; }
         let q = q.to_lowercase();
         (0..n).map(|k| if forward { (from + k) % n } else { (from + n - k % n) % n })
-            .find(|&i| self.entries[self.visible[i]].name.to_lowercase().contains(&q))
+            .find(|&i| self.haystack(&self.entries[self.visible[i]]).contains(&q))
     }
 
     pub fn key(&mut self, k: KeyEvent) -> Ev {
@@ -248,7 +355,17 @@ impl Browser {
             }
             KeyCode::Char('f') => self.mode = Mode::Filter(Input::new(&self.filter)),
             KeyCode::Char('.') => { self.show_hidden = !self.show_hidden; self.reload(None); }
-            KeyCode::Char('r') => self.reload(None),
+            KeyCode::Char('P') | KeyCode::Char('p') => {
+                self.layout = if self.layout == Layout::Clean { Layout::Detailed } else { Layout::Clean };
+                save_state(self.sort, self.layout);
+                self.spawn_meta();
+                return Ev::Info(format!("Layout: {}", if self.layout == Layout::Clean { "clean" } else { "detailed" }));
+            }
+            KeyCode::Char('u') | KeyCode::Char('r') => {
+                self.meta.lock().unwrap().clear();
+                self.reload(None);
+                return Ev::Info(format!("Refreshed — {} items", self.visible.len()));
+            }
             _ => {}
         }
         Ev::None
@@ -265,6 +382,7 @@ impl Browser {
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => match self.popup.take().unwrap() {
                 Popup::Sort(_) => {
                     self.sort = Sort::ALL[cur];
+                    save_state(self.sort, self.layout);
                     self.reload(None);
                 }
                 Popup::Action(_, path) => return Ev::Tag(path),
