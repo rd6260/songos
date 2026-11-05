@@ -1,6 +1,7 @@
 mod app;
 mod browser;
 mod config;
+mod lrclib;
 mod spotify;
 mod tags;
 mod ui;

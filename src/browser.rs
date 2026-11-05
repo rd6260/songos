@@ -92,9 +92,9 @@ fn read_meta(path: &Path) -> Meta {
     (get(ItemKey::TrackArtist), get(ItemKey::TrackTitle))
 }
 
-pub const ACTIONS: [&str; 1] = ["Tag from Spotify"];
+pub const ACTIONS: [&str; 2] = ["Tag from Spotify", "Tag lyrics from LRCLIB"];
 
-pub enum Ev { None, Quit, Tag(PathBuf), Status(String), Info(String) }
+pub enum Ev { None, Quit, Tag(PathBuf), Lyrics(PathBuf), Status(String), Info(String) }
 
 pub struct Browser {
     pub cwd: PathBuf,
@@ -413,7 +413,7 @@ impl Browser {
                     save_state(self.sort, self.layout);
                     self.reload(None);
                 }
-                Popup::Action(_, path) => return Ev::Tag(path),
+                Popup::Action(_, path) => return if cur == 1 { Ev::Lyrics(path) } else { Ev::Tag(path) },
             },
             _ => {}
         }

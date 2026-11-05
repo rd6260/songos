@@ -66,17 +66,21 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             if !app.br.filter.is_empty() { push(format!("find “{}”", app.br.filter)); }
         }
     }
+    else if matches!(app.screen, Screen::Lyrics | Screen::LyricsReview) { push("Tag lyrics from LRCLIB".into()); }
     else { push("Tag from Spotify".into()); }
-    if matches!(app.screen, Screen::Search | Screen::Compare) {
+    if matches!(app.screen, Screen::Search | Screen::Compare | Screen::Lyrics | Screen::LyricsReview) {
         if let Some(p) = &app.path { push(p.file_name().unwrap_or_default().to_string_lossy().into_owned()); }
     }
-    if app.screen == Screen::Compare { push("Review".into()); }
+    if matches!(app.screen, Screen::Compare | Screen::LyricsReview) { push("Review".into()); }
     f.render_widget(Paragraph::new(Line::from(crumbs)), head);
 
+    if app.loading.is_some() { return loading(f, body, foot, app.tick); }
     match app.screen {
         Screen::Browser => browser(f, body, app),
         Screen::Search => search(f, body, app),
         Screen::Compare => compare(f, body, app),
+        Screen::Lyrics => lyrics_search(f, body, app),
+        Screen::LyricsReview => lyrics_review(f, body, app),
     }
 
     // footer: status wins over hints
@@ -94,6 +98,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 Focus::Input => key_hint(&[("↵", "search spotify"), ("↓", "results"), ("esc", "back")]),
                 Focus::Results => key_hint(&[("↑↓", "browse"), ("↵", "pick track"), ("/", "edit query"), ("esc", "query")]),
             },
+            Screen::Lyrics => match app.lyr.as_ref().map(|l| l.focus) {
+                Some(Focus::Results) => key_hint(&[("↑↓", "browse"), ("↵", "review lyrics"), ("/", "edit query"), ("esc", "query")]),
+                _ => key_hint(&[("↵", "search lrclib"), ("↓", "results"), ("esc", "back")]),
+            },
+            Screen::LyricsReview => {
+                let r = app.lyr.as_ref().and_then(|l| l.review.as_ref()).unwrap();
+                if r.confirm { key_hint(&[("y", "save to file"), ("n", "cancel")]) }
+                else if r.saving.is_some() { key_hint(&[("…", "writing lyrics, please wait")]) }
+                else if r.focus == RFocus::Buttons { key_hint(&[("h/l", "choose"), ("↵", "activate"), ("k", "back to lyrics"), ("tab", "version"), ("esc", "other result")]) }
+                else { key_hint(&[("J/K", "scroll"), ("h/l", "switch pane"), ("j", "buttons"), ("tab", "version"), ("s", "save"), ("esc", "other result")]) }
+            }
             Screen::Compare => {
                 let c = app.cmp.as_ref().unwrap();
                 if c.confirm { key_hint(&[("y", "save to file"), ("n", "cancel")]) }
@@ -107,6 +122,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         }
     };
     f.render_widget(Paragraph::new(line), foot);
+
 }
 
 fn center_v(area: Rect, h: u16) -> Rect {
@@ -624,16 +640,33 @@ fn compare(f: &mut Frame, area: Rect, app: &mut App) {
     }
 
     if let Some(start) = c.saving {
-        saving_overlay(f, area, app.tick, start.elapsed(), app.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+        saving_overlay(f, area, app.tick, start.elapsed(), app.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), "Writing tags & cover art…", "Saving");
     }
 }
 
+/// Bare "Loading" text and a moving bar, centred in the page.
+fn loading(f: &mut Frame, area: Rect, foot: Rect, tick: usize) {
+    f.render_widget(Paragraph::new(Line::raw("")), foot);
+    let w = 40.min(area.width);
+    let r = Rect { x: area.x + (area.width - w) / 2, y: area.y + area.height.saturating_sub(3) / 2, width: w, height: 3.min(area.height) };
+    let seg = (w as usize / 4).max(3);
+    let span = (w as usize).saturating_sub(seg).max(1);
+    let t = tick % (span * 2);
+    let pos = if t < span { t } else { span * 2 - t };
+    let bar: String = (0..w as usize).map(|i| if i >= pos && i < pos + seg { '█' } else { '░' }).collect();
+    f.render_widget(Paragraph::new(vec![
+        Line::from(vec![Span::styled(format!("{} ", SPIN[tick / 2 % 10]), Style::new().fg(ACCENT).bold()), Span::styled("Loading", Style::new().fg(TEXT).bold())]),
+        Line::raw(""),
+        Line::from(Span::styled(bar, Style::new().fg(ACCENT))),
+    ]), r);
+}
+
 /// Indeterminate progress: lofty gives no byte progress, so show activity + elapsed time.
-fn saving_overlay(f: &mut Frame, area: Rect, tick: usize, elapsed: std::time::Duration, file: String) {
+fn saving_overlay(f: &mut Frame, area: Rect, tick: usize, elapsed: std::time::Duration, file: String, what: &str, heading: &str) {
     let w = 54.min(area.width);
     let r = Rect { x: area.x + (area.width - w) / 2, y: area.y + area.height.saturating_sub(7) / 2, width: w, height: 7.min(area.height) };
     f.render_widget(Clear, r);
-    let block = panel(title("Saving", true), true);
+    let block = panel(title(heading, true), true);
     let inner = block.inner(r);
     f.render_widget(block, r);
     let bar_w = inner.width.saturating_sub(2) as usize;
@@ -643,11 +676,173 @@ fn saving_overlay(f: &mut Frame, area: Rect, tick: usize, elapsed: std::time::Du
     let pos = if t < span { t } else { span * 2 - t };
     let bar: String = (0..bar_w).map(|i| if i >= pos && i < pos + seg { '█' } else { '░' }).collect();
     let lines = vec![
-        Line::from(vec![Span::styled(format!("{} ", SPIN[tick / 2 % 10]), Style::new().fg(ACCENT).bold()), Span::styled("Writing tags & cover art…", Style::new().fg(TEXT).bold())]),
+        Line::from(vec![Span::styled(format!("{} ", SPIN[tick / 2 % 10]), Style::new().fg(ACCENT).bold()), Span::styled(what.to_string(), Style::new().fg(TEXT).bold())]),
         Line::from(Span::styled(trunc(&file, inner.width as usize), Style::new().fg(MUTED))),
         Line::raw(""),
         Line::from(Span::styled(bar, Style::new().fg(ACCENT))),
-        Line::from(Span::styled(format!("{:.1}s — don't close the terminal", elapsed.as_secs_f32()), Style::new().fg(DIM))),
+        Line::from(Span::styled(format!("{:.1}s{}", elapsed.as_secs_f32(), if heading == "Saving" { " — don't close the terminal" } else { "" }), Style::new().fg(DIM))),
     ];
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+// ---------------------------------------------------------------- lyrics (LRCLIB)
+fn lyric_badge(r: &crate::lrclib::Rec) -> Span<'static> {
+    if r.instrumental { Span::styled(" instrumental", Style::new().fg(BAD)) }
+    else if r.has_synced() && r.has_plain() { Span::styled(" synced + plain", Style::new().fg(ACCENT)) }
+    else if r.has_synced() { Span::styled(" synced", Style::new().fg(ACCENT)) }
+    else if r.has_plain() { Span::styled(" plain", Style::new().fg(CHANGED)) }
+    else { Span::styled(" no lyrics", Style::new().fg(BAD)) }
+}
+
+fn lyric_kind(s: &str) -> String {
+    if s.trim().is_empty() { return "none".into(); }
+    let synced = s.lines().next().is_some_and(|l| l.trim_start().starts_with('['));
+    let kind = if s.contains(crate::lrclib::SEP.trim()) { "synced + plain" } else if synced { "synced" } else { "plain" };
+    format!("{kind} · {} lines", s.lines().count())
+}
+
+fn lyrics_search(f: &mut Frame, area: Rect, app: &mut App) {
+    let tick = app.tick;
+    let Some(l) = app.lyr.as_mut() else { return };
+    let [cur, inp, body] = Layout::vertical([Constraint::Length(8), Constraint::Length(3), Constraint::Min(4)]).areas(area);
+    let cells = current_cells(&app.current, app.current_dims, app.current.cover.as_ref().map(|c| c.len()), true);
+    let label = if app.current.is_empty() { "Current tags · none found".to_string() }
+        else { format!("Current tags · lyrics: {}", lyric_kind(&l.current)) };
+    tags_panel(f, cur, &label, false, &cells, None, None, None, None, Some((&mut app.current_proto, "no cover")));
+    input_box(f, inp, "Search LRCLIB", &l.query, l.focus == Focus::Input, "song title artist…");
+
+    let [left, right] = Layout::horizontal([Constraint::Percentage(44), Constraint::Percentage(56)]).areas(body);
+    let active = l.focus == Focus::Results;
+    if l.results.is_empty() {
+        let msg = if l.searching { format!("{} Searching LRCLIB…", SPIN[tick / 2 % 10]) }
+            else if l.searched { "Nothing found".to_string() }
+            else { "Press ↵ to search LRCLIB with the query above".to_string() };
+        f.render_widget(panel(title("Results", false), false), body);
+        f.render_widget(Paragraph::new(msg).style(Style::new().fg(MUTED)).alignment(Alignment::Center), center_v(body.inner(Margin::new(1, 1)), 1));
+        return;
+    }
+    let w = left.width.saturating_sub(6) as usize;
+    let local = l.local_ms;
+    let items: Vec<ListItem> = l.results.iter().map(|r| {
+        let delta = if r.duration.is_some() && local > 0 {
+            let d = (r.duration_ms() as i64 - local as i64) / 1000;
+            if d == 0 { String::new() } else { format!(" ({d:+}s)") }
+        } else { String::new() };
+        ListItem::new(vec![
+            Line::from(vec![Span::styled(trunc(&r.name, w.saturating_sub(16)), Style::new().fg(TEXT).bold()), lyric_badge(r)]),
+            Line::from(Span::styled(trunc(&format!("{} · {} · {}{delta}", r.artist, r.album, fmt_dur(r.duration_ms())), w), Style::new().fg(MUTED))),
+        ])
+    }).collect();
+    let list = List::new(items)
+        .block(panel(title(&format!("Results ({})", l.results.len()), active), active))
+        .highlight_style(Style::new().bg(SEL_BG))
+        .highlight_symbol("▍ ")
+        .highlight_spacing(HighlightSpacing::Always);
+    f.render_stateful_widget(list, left, &mut l.list);
+
+    let block = panel(title("Lyrics preview", false), false);
+    let inner = block.inner(right);
+    f.render_widget(block, right);
+    if let Some(r) = l.list.selected().and_then(|i| l.results.get(i)) {
+        let text = if r.has_synced() { &r.synced } else { &r.plain };
+        let lines: Vec<Line> = if text.trim().is_empty() {
+            vec![Line::from(Span::styled(if r.instrumental { "instrumental" } else { "no lyrics" }, Style::new().fg(DIM)))]
+        } else {
+            text.lines().take(inner.height as usize).map(|s| Line::from(Span::styled(fit(s, inner.width as usize), Style::new().fg(TEXT)))).collect()
+        };
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+}
+
+fn lyrics_review(f: &mut Frame, area: Rect, app: &mut App) {
+    let tick = app.tick;
+    let file = app.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let Some(l) = app.lyr.as_mut() else { return };
+    let Some(r) = l.review.as_mut() else { return };
+    let head_h = if area.height >= 20 { 8 } else { 4 };
+    let [head, panes, buttons] = Layout::vertical([Constraint::Length(head_h), Constraint::Min(4), Constraint::Length(1)]).areas(area);
+
+    let rec = &r.rec;
+    let d = (rec.duration_ms() as i64 - l.local_ms as i64) / 1000;
+    let both = rec.versions().len() > 1;
+    let hb = panel(title("LRCLIB match", false), false);
+    let hi = hb.inner(head);
+    f.render_widget(hb, head);
+    // album art of the file, left of the match info
+    let info = if head_h > 4 {
+        let aw = (hi.height * 2).min(hi.width / 3);
+        let [a, i] = Layout::horizontal([Constraint::Length(aw), Constraint::Min(10)]).spacing(2).areas(hi);
+        thumb(f, a, app.current_proto.as_mut(), "no cover");
+        i
+    } else { hi };
+    let row = |k: &str, v: Span<'static>| Line::from(vec![Span::styled(format!("{k:<9}"), Style::new().fg(MUTED)), v]);
+    let mut lines = vec![
+        Line::from(Span::styled(trunc(&rec.name, info.width as usize), Style::new().fg(TEXT).bold())),
+        Line::from(Span::styled(trunc(&rec.artist, info.width as usize), Style::new().fg(ACCENT))),
+    ];
+    if head_h > 4 { lines.push(row("Album", Span::styled(trunc(&rec.album, (info.width as usize).saturating_sub(9)), Style::new().fg(TEXT)))); lines.push(Line::raw("")); }
+    lines.push(row("Version", Span::styled(format!("{}{}", r.ver.label(), if both { "  (tab to switch)" } else { "" }), Style::new().fg(CHANGED).bold())));
+    lines.push(row("Length", Span::styled(format!("{} ({d:+}s vs file)", fmt_dur(rec.duration_ms())), Style::new().fg(if d.abs() > 5 { BAD } else { MUTED }))));
+    f.render_widget(Paragraph::new(lines), info);
+
+    let [lp, rp] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(panes);
+    r.view_h = Block::bordered().padding(Padding::horizontal(1)).inner(lp).height as usize;
+    let vh = r.view_h;
+    // clamp in case the pane got taller or the text shorter
+    let show = |f: &mut Frame, a: Rect, label: &str, text: &str, color: Color, active: bool, scroll: &mut usize| {
+        let b = panel(title(label, active), active);
+        let inner = b.inner(a);
+        f.render_widget(b, a);
+        let total = text.lines().count();
+        *scroll = (*scroll).min(total.saturating_sub(vh));
+        let lines: Vec<Line> = if text.trim().is_empty() {
+            vec![Line::from(Span::styled("— none —", Style::new().fg(DIM).italic()))]
+        } else {
+            text.lines().skip(*scroll).take(inner.height as usize)
+                .map(|s| Line::from(Span::styled(fit(s, inner.width.saturating_sub(1) as usize), Style::new().fg(color)))).collect()
+        };
+        f.render_widget(Paragraph::new(lines), inner);
+        if total > vh && inner.width > 0 {
+            let mut st = ScrollbarState::new(total - vh + 1).position(*scroll);
+            f.render_stateful_widget(Scrollbar::new(ScrollbarOrientation::VerticalRight).begin_symbol(None).end_symbol(None).style(Style::new().fg(DIM)),
+                Rect { x: a.right().saturating_sub(2), y: inner.y, width: 1, height: inner.height }, &mut st);
+        }
+    };
+    show(f, lp, &format!("Current lyrics · {}", lyric_kind(&l.current)), &l.current, MUTED, r.focus == RFocus::Current, &mut r.scroll_cur);
+    show(f, rp, &format!("New lyrics · {}", lyric_kind(&r.new_text)), &r.new_text, CHANGED, r.focus == RFocus::New, &mut r.scroll_new);
+    let r = &*r;
+
+    let btn = |label: &str, i: usize, color: Color| {
+        let on = r.focus == RFocus::Buttons && r.sel == i;
+        Span::styled(format!("  {label}  "), if on { Style::new().fg(Color::Black).bg(color).bold() } else { Style::new().fg(color).bg(SEL_BG) })
+    };
+    f.render_widget(Paragraph::new(Line::from(vec![
+        Span::raw(" "), btn("✔ Save lyrics", 0, ACCENT), Span::raw("   "), btn("✕ Cancel", 1, BAD),
+    ])), buttons);
+
+    if r.confirm {
+        let lines = vec![
+            Line::from(Span::styled(format!("Write lyrics to {}?", trunc(&file, 40)), Style::new().fg(TEXT).bold())),
+            Line::raw(""),
+            Line::from(Span::styled(
+                format!("  • {} lyrics{}", r.ver.label(), if l.current.trim().is_empty() { "" } else { " (replaces existing)" }),
+                Style::new().fg(CHANGED))),
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled(" y ", Style::new().fg(Color::Black).bg(ACCENT).bold()), Span::styled(" Save   ", Style::new().fg(TEXT)),
+                Span::styled(" n ", Style::new().fg(Color::Black).bg(BAD).bold()), Span::styled(" Cancel", Style::new().fg(TEXT)),
+            ]),
+        ];
+        let h = lines.len() as u16 + 2;
+        let w = 60.min(area.width);
+        let rc = Rect { x: area.x + (area.width - w) / 2, y: area.y + area.height.saturating_sub(h) / 2, width: w, height: h.min(area.height) };
+        f.render_widget(Clear, rc);
+        let block = panel(title("Confirm", true), true);
+        let inner = block.inner(rc);
+        f.render_widget(block, rc);
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+    if let Some(start) = r.saving {
+        saving_overlay(f, area, tick, start.elapsed(), file, "Writing lyrics…", "Saving");
+    }
 }

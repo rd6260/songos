@@ -1,5 +1,6 @@
 use crate::browser::{Browser, Ev};
 use crate::config::Config;
+use crate::lrclib::{Rec, Ver};
 use crate::spotify::{Spotify, Track};
 use crate::tags::{self, Field, Tags};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -13,7 +14,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 #[derive(PartialEq, Clone, Copy)]
-pub enum Screen { Browser, Search, Compare }
+pub enum Screen { Browser, Search, Compare, Lyrics, LyricsReview }
 #[derive(PartialEq, Clone, Copy)]
 pub enum Focus { Input, Results }
 
@@ -21,6 +22,9 @@ pub enum Msg {
     Search(u64, Result<Vec<Track>, String>),
     Preview(String, Option<DynamicImage>),
     Saved(Result<PathBuf, String>),
+    LyricSearch(u64, Result<Vec<Rec>, String>),
+    LyricSaved(Result<(), String>),
+    LyricsLoaded(PathBuf, Result<(Tags, String, Option<DynamicImage>), String>),
     Peek(PathBuf, Option<(Tags, usize, Option<(DynamicImage, (u32, u32))>)>),
     Best(String, Result<(Vec<u8>, DynamicImage), String>),
 }
@@ -122,6 +126,51 @@ pub struct Compare {
     pub cover_err: Option<String>,
 }
 
+/// "Tag lyrics from LRCLIB" flow: search page, then a review page.
+pub struct Lyr {
+    pub query: Input,
+    pub focus: Focus,
+    pub results: Vec<Rec>,
+    pub list: ListState,
+    pub searching: bool,
+    pub searched: bool,
+    /// Lyrics already embedded in the file.
+    pub current: String,
+    pub local_ms: u64,
+    pub review: Option<LyrReview>,
+}
+
+/// The single focused element of the lyrics review page.
+#[derive(PartialEq, Clone, Copy)]
+pub enum RFocus { Current, New, Buttons }
+
+pub struct LyrReview {
+    pub rec: Rec,
+    /// Which version of the record is shown/saved.
+    pub ver: Ver,
+    pub focus: RFocus,
+    /// Pane to return to when leaving the buttons.
+    pub last_pane: RFocus,
+    /// 0 = Save, 1 = Cancel.
+    pub sel: usize,
+    pub confirm: bool,
+    pub saving: Option<std::time::Instant>,
+    pub scroll_cur: usize,
+    pub scroll_new: usize,
+    /// Visible text rows per pane (set while drawing) — scrolling stops when everything fits.
+    pub view_h: usize,
+    pub new_text: String,
+}
+
+impl LyrReview {
+    pub fn text(&self) -> &str { &self.new_text }
+    pub fn set_ver(&mut self, v: Ver) {
+        self.ver = v;
+        self.new_text = self.rec.text_of(v);
+        self.scroll_new = 0;
+    }
+}
+
 /// What the browser's side panel shows for the song under the cursor.
 pub struct Peek {
     pub path: PathBuf,
@@ -157,6 +206,12 @@ pub struct App {
     pub peek: Option<Peek>,
     peek_pending: Option<PathBuf>,
     pub cmp: Option<Compare>,
+    pub lyr: Option<Lyr>,
+    lyr_seq: u64,
+    /// Last lyrics version the user chose; applied to the next review when available.
+    pub lyr_ver: Ver,
+    /// A background file read in progress (file name, started) — drives the loading overlay.
+    pub loading: Option<(String, std::time::Instant)>,
     pub status: Option<(String, bool)>,
     pub tick: usize,
     pub quit: bool,
@@ -174,7 +229,7 @@ impl App {
             searching: false, search_seq: 0, searched: false,
             previews: HashMap::new(), pending: HashSet::new(),
             peek: None, peek_pending: None,
-            cmp: None, status: None, tick: 0, quit: false,
+            cmp: None, lyr: None, lyr_seq: 0, lyr_ver: Ver::Synced, loading: None, status: None, tick: 0, quit: false,
         }
     }
 
@@ -212,6 +267,45 @@ impl App {
                     }
                     Err(e) => {
                         if let Some(c) = self.cmp.as_mut() { c.saving = None; }
+                        self.err(format!("Write failed: {e}"));
+                    }
+                },
+                Msg::LyricSearch(seq, r) if seq == self.lyr_seq => {
+                    let mut msg = None;
+                    if let Some(l) = self.lyr.as_mut() {
+                        l.searching = false;
+                        l.searched = true;
+                        match r {
+                            Ok(t) => {
+                                l.list.select(if t.is_empty() { None } else { Some(0) });
+                                if t.is_empty() { msg = Some("No results — try a simpler query".to_string()); }
+                                l.results = t;
+                                if !l.results.is_empty() { l.focus = Focus::Results; }
+                            }
+                            Err(e) => msg = Some(e),
+                        }
+                    }
+                    match msg { Some(m) => self.err(m), None => self.status = None }
+                }
+                Msg::LyricSearch(..) => {}
+                Msg::LyricsLoaded(path, r) => {
+                    self.loading = None;
+                    match r {
+                        Ok((t, current, img)) => self.open_lyrics(path, t, current, img),
+                        Err(e) => { self.screen = Screen::Browser; self.err(format!("Couldn't read tags: {e}")); }
+                    }
+                }
+                Msg::LyricSaved(r) => match r {
+                    Ok(()) => {
+                        let name = file_name(self.path.as_deref());
+                        self.lyr = None;
+                        self.peek = None;
+                        self.screen = Screen::Browser;
+                        self.br.reload(Some(name.clone()));
+                        self.ok(format!("Lyrics saved ✓  {name}"));
+                    }
+                    Err(e) => {
+                        if let Some(rv) = self.lyr.as_mut().and_then(|l| l.review.as_mut()) { rv.saving = None; }
                         self.err(format!("Write failed: {e}"));
                     }
                 },
@@ -280,8 +374,13 @@ impl App {
 
     // ---------- keys ----------
     pub fn key(&mut self, k: KeyEvent) {
+        if self.loading.is_some() {
+            if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') { self.quit = true; }
+            return;
+        }
         // Don't let anything interrupt a write in progress.
         if self.cmp.as_ref().is_some_and(|c| c.saving.is_some()) { return; }
+        if self.lyr.as_ref().and_then(|l| l.review.as_ref()).is_some_and(|r| r.saving.is_some()) { return; }
         if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
             self.quit = true;
             return;
@@ -290,6 +389,8 @@ impl App {
             Screen::Browser => self.key_browser(k),
             Screen::Search => self.key_search(k),
             Screen::Compare => self.key_compare(k),
+            Screen::Lyrics => self.key_lyrics(k),
+            Screen::LyricsReview => self.key_lyric_review(k),
         }
     }
 
@@ -301,6 +402,7 @@ impl App {
             Ev::None => {}
             Ev::Quit => self.quit = true,
             Ev::Tag(p) => self.load_song(p),
+            Ev::Lyrics(p) => self.load_lyrics(p),
             Ev::Status(m) => self.err(m),
             Ev::Info(m) => self.ok(m),
         }
@@ -311,6 +413,188 @@ impl App {
         self.status = None;
         self.screen = Screen::Browser;
         self.br.reload(None);
+    }
+
+    /// Read the file on a worker thread (tags, embedded lyrics, cover decode can be slow
+    /// on big files), then open the LRCLIB page from `Msg::LyricsLoaded`.
+    fn load_lyrics(&mut self, path: PathBuf) {
+        self.loading = Some((file_name(Some(&path)), std::time::Instant::now()));
+        self.lyr = None;
+        self.status = None;
+        // leave the browser at once so its cover image isn't drawn over
+        self.screen = Screen::Lyrics;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let r = tags::read(&path).map_err(|e| format!("{e:#}")).map(|t| {
+                let img = t.cover.as_ref().and_then(|b| image::load_from_memory(b).ok());
+                (t, tags::read_lyrics(&path).unwrap_or_default(), img)
+            });
+            let _ = tx.send(Msg::LyricsLoaded(path, r));
+        });
+    }
+
+    fn open_lyrics(&mut self, path: PathBuf, t: Tags, current: String, img: Option<DynamicImage>) {
+        let q = if t.get(Field::Title).is_empty() {
+            path.file_stem().map(|s| s.to_string_lossy().replace(" - ", " ").replace('_', " ")).unwrap_or_default()
+        } else {
+            format!("{} {}", t.get(Field::Title), t.get(Field::Artist)).trim().to_string()
+        };
+        self.current_dims = img.as_ref().map(|i| (i.width(), i.height()));
+        self.current_proto = img.map(|i| self.picker.new_resize_protocol(i));
+        let local_ms = t.duration_ms;
+        self.current = t;
+        self.lyr = Some(Lyr {
+            query: Input::new(&q), focus: Focus::Input, results: vec![], list: ListState::default(),
+            searching: false, searched: false, current, local_ms, review: None,
+        });
+        self.path = Some(path);
+        self.status = None;
+        self.screen = Screen::Lyrics;
+        self.lyric_search();
+    }
+
+    fn lyric_search(&mut self) {
+        let Some(l) = self.lyr.as_mut() else { return };
+        let q = l.query.text.trim().to_string();
+        if q.is_empty() { return; }
+        self.lyr_seq += 1;
+        let (seq, local_ms) = (self.lyr_seq, l.local_ms);
+        l.searching = true;
+        self.status = None;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let r = crate::lrclib::search(&q, local_ms).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Msg::LyricSearch(seq, r));
+        });
+    }
+
+    fn key_lyrics(&mut self, k: KeyEvent) {
+        enum Act { None, Back, Search, Pick }
+        let mut act = Act::None;
+        {
+            let Some(l) = self.lyr.as_mut() else { return };
+            match l.focus {
+                Focus::Input => match k.code {
+                    KeyCode::Esc => act = Act::Back,
+                    KeyCode::Enter => act = Act::Search,
+                    KeyCode::Down | KeyCode::Tab if !l.results.is_empty() => l.focus = Focus::Results,
+                    _ => { l.query.key(&k); }
+                },
+                Focus::Results => {
+                    let cur = l.list.selected().unwrap_or(0);
+                    match k.code {
+                        KeyCode::Esc | KeyCode::Tab | KeyCode::Char('/') => l.focus = Focus::Input,
+                        KeyCode::Up | KeyCode::Char('k') => l.list.select(Some(cur.saturating_sub(1))),
+                        KeyCode::Down | KeyCode::Char('j') => l.list.select(Some((cur + 1).min(l.results.len() - 1))),
+                        KeyCode::Enter => act = Act::Pick,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        match act {
+            Act::Back => { self.lyr = None; self.back_to_browser(); }
+            Act::Search => self.lyric_search(),
+            Act::Pick => self.open_lyric_review(),
+            Act::None => {}
+        }
+    }
+
+    fn open_lyric_review(&mut self) {
+        let Some(l) = self.lyr.as_mut() else { return };
+        let Some(rec) = l.list.selected().and_then(|i| l.results.get(i)).cloned() else { return };
+        if !rec.has_any() {
+            self.err(if rec.instrumental { "That track is instrumental — no lyrics" } else { "No lyrics for this result" });
+            return;
+        }
+        let ver = rec.pick(self.lyr_ver);
+        let new_text = rec.text_of(ver);
+        l.review = Some(LyrReview {
+            rec, ver, focus: RFocus::New, last_pane: RFocus::New, sel: 0, confirm: false, saving: None,
+            scroll_cur: 0, scroll_new: 0, view_h: 0, new_text,
+        });
+        self.status = None;
+        self.screen = Screen::LyricsReview;
+    }
+
+    fn key_lyric_review(&mut self, k: KeyEvent) {
+        enum Act { None, Save, Cancel, Back }
+        let mut act = Act::None;
+        let mut warn = None;
+        {
+            let Some(l) = self.lyr.as_mut() else { return };
+            let Some(r) = l.review.as_mut() else { return };
+            let n_lines = |s: &str| s.lines().count();
+            let same = r.text().trim() == l.current.trim();
+            if r.confirm {
+                match k.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => { r.confirm = false; act = Act::Save; }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => r.confirm = false,
+                    _ => {}
+                }
+            } else if k.code == KeyCode::Esc {
+                act = Act::Back;
+            } else if matches!(k.code, KeyCode::Tab | KeyCode::Char('t')) {
+                if r.rec.versions().len() > 1 {
+                    let v = r.rec.next_ver(r.ver);
+                    r.set_ver(v);
+                    self.lyr_ver = v;
+                } else { warn = Some("Only one version of these lyrics is available"); }
+            } else if r.focus == RFocus::Buttons {
+                match k.code {
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => r.sel = 1 - r.sel,
+                    KeyCode::Up | KeyCode::Char('k') => r.focus = r.last_pane,
+                    KeyCode::Enter | KeyCode::Char(' ') if r.sel == 1 => act = Act::Cancel,
+                    KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('s') => {
+                        if same { warn = Some("Nothing to save — file already has these lyrics"); } else { r.confirm = true; }
+                    }
+                    _ => {}
+                }
+            } else {
+                {
+                    let (total, scroll) = if r.focus == RFocus::Current { (n_lines(&l.current), &mut r.scroll_cur) } else { (n_lines(&r.new_text), &mut r.scroll_new) };
+                    let max = total.saturating_sub(r.view_h.max(1));
+                    match k.code {
+                        KeyCode::Char('K') => *scroll = scroll.saturating_sub(1),
+                        KeyCode::Char('J') => *scroll = (*scroll + 1).min(max),
+                        KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+                        KeyCode::PageDown => *scroll = (*scroll + 10).min(max),
+                        KeyCode::Home | KeyCode::Char('g') => *scroll = 0,
+                        KeyCode::End | KeyCode::Char('G') => *scroll = max,
+                        KeyCode::Left | KeyCode::Char('h') => { r.focus = RFocus::Current; r.last_pane = r.focus; }
+                        KeyCode::Right | KeyCode::Char('l') => { r.focus = RFocus::New; r.last_pane = r.focus; }
+                        KeyCode::Down | KeyCode::Char('j') => { r.last_pane = r.focus; r.focus = RFocus::Buttons; }
+                        KeyCode::Char('s') => {
+                            if same { warn = Some("Nothing to save — file already has these lyrics"); } else { r.confirm = true; }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if let Some(w) = warn { self.err(w); }
+        match act {
+            Act::Save => self.save_lyrics(),
+            Act::Back => { if let Some(l) = self.lyr.as_mut() { l.review = None; } self.status = None; self.screen = Screen::Lyrics; }
+            Act::Cancel => { self.lyr = None; self.back_to_browser(); }
+            Act::None => {}
+        }
+    }
+
+    /// Write on a worker thread (big files are rewritten in full).
+    fn save_lyrics(&mut self) {
+        let (Some(r), Some(path)) = (self.lyr.as_mut().and_then(|l| l.review.as_mut()), self.path.clone()) else { return };
+        let (main, plain) = match r.ver {
+            Ver::Both => (r.rec.synced.trim_end().to_string(), Some(r.rec.plain.trim().to_string())),
+            v => (r.rec.text_of(v), None),
+        };
+        r.saving = Some(std::time::Instant::now());
+        self.status = None;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let res = tags::write_lyrics(&path, &main, plain.as_deref()).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Msg::LyricSaved(res));
+        });
     }
 
     pub fn load_song(&mut self, path: PathBuf) {

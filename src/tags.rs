@@ -86,3 +86,38 @@ pub fn write(path: &Path, new: &Tags, cover: Option<&[u8]>) -> Result<()> {
     tf.save_to_path(path, WriteOptions::default())?;
     Ok(())
 }
+
+/// Embed lyrics in the file's primary tag. `plain` is stored alongside `main` when given
+/// (needs a format with separate synced/unsynced lyric fields, e.g. FLAC/Vorbis, MP4).
+pub fn write_lyrics(path: &Path, main: &str, plain: Option<&str>) -> Result<()> {
+    let mut tf = lofty::read_from_path(path)?;
+    if tf.primary_tag().is_none() {
+        let tt = tf.primary_tag_type();
+        tf.insert_tag(Tag::new(tt));
+    }
+    let tag = tf.primary_tag_mut().ok_or_else(|| anyhow!("no writable tag"))?;
+    tag.remove_key(ItemKey::Lyrics);
+    tag.remove_key(ItemKey::UnsyncLyrics);
+    // ID3v2 has no separate "synced text" item: everything goes in USLT.
+    let id3 = !tag.insert_text(ItemKey::Lyrics, main.to_string());
+    if id3 {
+        if plain.is_some() { return Err(anyhow!("this file format can only hold one lyrics version — pick synced or plain")); }
+        tag.insert_text(ItemKey::UnsyncLyrics, main.to_string());
+    }
+    if let Some(p) = plain {
+        if !tag.insert_text(ItemKey::UnsyncLyrics, p.to_string()) { return Err(anyhow!("couldn't store plain lyrics in this format")); }
+    }
+    tf.save_to_path(path, WriteOptions::default())?;
+    Ok(())
+}
+
+/// Lyrics currently embedded in the file, if any (synced + plain joined like `Ver::Both`).
+pub fn read_lyrics(path: &Path) -> Option<String> {
+    let tf = lofty::read_from_path(path).ok()?;
+    let tag = tf.primary_tag().or_else(|| tf.first_tag())?;
+    let get = |k| tag.get_string(k).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    match (get(ItemKey::Lyrics), get(ItemKey::UnsyncLyrics)) {
+        (Some(a), Some(b)) if a != b => Some(format!("{a}{}{b}", crate::lrclib::SEP)),
+        (a, b) => a.or(b),
+    }
+}
