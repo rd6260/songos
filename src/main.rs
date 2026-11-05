@@ -29,6 +29,7 @@ fn main() -> Result<()> {
     let res = (|| -> Result<()> {
         while !app.quit {
             app.pump();
+            app.update_peek();
             terminal.draw(|f| ui::draw(f, &mut app))?;
             if event::poll(Duration::from_millis(50))? {
                 if let Event::Key(k) = event::read()? {

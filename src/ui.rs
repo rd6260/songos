@@ -180,7 +180,12 @@ fn browser(f: &mut Frame, area: Rect, app: &mut App) {
         }
         BrowserLayout::Clean => {
             // no border, no icons: artist left, title right (file name when untagged)
-            let area = Rect { y: list_area.y + 1, height: list_area.height.saturating_sub(1), ..list_area };
+            let full = Rect { y: list_area.y + 1, height: list_area.height.saturating_sub(1), ..list_area };
+            // song info panel on the right, like the Spotify results page (needs some width)
+            let (area, side) = if full.width >= 90 {
+                let [l, r] = Layout::horizontal([Constraint::Percentage(56), Constraint::Percentage(44)]).areas(full);
+                (l, Some(Rect { width: r.width.saturating_sub(1), ..r }))
+            } else { (full, None) };
             let w = area.width.saturating_sub(4) as usize;
             let items: Vec<ListItem> = {
                 let meta = br.meta.lock().unwrap();
@@ -207,6 +212,10 @@ fn browser(f: &mut Frame, area: Rect, app: &mut App) {
             };
             let list = List::new(items).highlight_style(Style::new().bg(SEL_BG).bold());
             f.render_stateful_widget(list, area, &mut br.list);
+            if let Some(side) = side {
+                let sel = br.selected().map(|e| (e.path.clone(), e.name.clone(), e.is_dir, e.audio, e.size));
+                peek_panel(f, side, sel, &mut app.peek, app.tick);
+            }
         }
     }
     if empty {
@@ -242,6 +251,59 @@ fn browser(f: &mut Frame, area: Rect, app: &mut App) {
         }
         None => {}
     }
+}
+
+/// Info about the song under the cursor: cover on top, tags below (mirrors `detail`).
+fn peek_panel(f: &mut Frame, area: Rect, sel: Option<(std::path::PathBuf, String, bool, bool, u64)>, peek: &mut Option<Peek>, tick: usize) {
+    let block = panel(title("Song info", false), false);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let note = |f: &mut Frame, lines: Vec<Line<'static>>| {
+        f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), center_v(inner, 3));
+    };
+    let Some((path, name, is_dir, audio, size)) = sel else { return };
+    if is_dir {
+        return note(f, vec![Line::from(Span::styled(name, Style::new().fg(ACCENT).bold())), Line::from(Span::styled("folder", Style::new().fg(MUTED)))]);
+    }
+    if !audio {
+        return note(f, vec![Line::from(Span::styled(name, Style::new().fg(TEXT))), Line::from(Span::styled(format!("not an audio file · {}", human(size)), Style::new().fg(MUTED)))]);
+    }
+    let Some(p) = peek.as_mut().filter(|p| p.path == path) else {
+        return note(f, vec![Line::from(Span::styled(format!("{} reading tags", SPIN[tick / 2 % 10]), Style::new().fg(DIM)))]);
+    };
+
+    let meta_h = 10u16.min(inner.height.saturating_sub(4));
+    let art_h = inner.height.saturating_sub(meta_h + 1);
+    let [art, _, meta] = Layout::vertical([Constraint::Length(art_h), Constraint::Length(1), Constraint::Length(meta_h)]).areas(inner);
+    let aw = (art.height * 2).min(art.width);
+    let art = Rect { x: art.x + (art.width - aw) / 2, width: aw, ..art };
+    thumb(f, art, p.proto.as_mut(), "no cover");
+
+    let t = &p.tags;
+    let dash = |s: &str| if s.is_empty() { "—".to_string() } else { s.to_string() };
+    let row = |k: &str, v: String| Line::from(vec![
+        Span::styled(format!("{k:<11}"), Style::new().fg(MUTED)),
+        Span::styled(v, Style::new().fg(TEXT)),
+    ]);
+    let title_txt = if t.get(Field::Title).is_empty() { name } else { t.get(Field::Title).to_string() };
+    let track = match (t.get(Field::Track), t.get(Field::Disc)) {
+        ("", _) => "—".to_string(),
+        (n, "") => n.to_string(),
+        (n, d) => format!("{n}  ·  disc {d}"),
+    };
+    let lines = vec![
+        Line::from(Span::styled(title_txt, Style::new().fg(TEXT).bold())),
+        Line::from(Span::styled(t.get(Field::Artist).to_string(), Style::new().fg(ACCENT))),
+        Line::raw(""),
+        row("Album", dash(t.get(Field::Album))),
+        row("Released", dash(t.get(Field::Year))),
+        row("Track", track),
+        row("Length", if t.duration_ms > 0 { fmt_dur(t.duration_ms) } else { "—".into() }),
+        row("Genre", dash(t.get(Field::Genre))),
+        row("ISRC", dash(t.get(Field::Isrc))),
+        row("Cover", p.dims.map(|(w, h)| format!("{w}×{h}  {}", kb(p.cover_len))).unwrap_or_else(|| "—".into())),
+    ];
+    f.render_widget(Paragraph::new(lines), meta);
 }
 
 fn popup(f: &mut Frame, area: Rect, label: &str, items: Vec<ListItem>, st: &mut ListState, w: u16) {

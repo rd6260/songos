@@ -21,6 +21,7 @@ pub enum Msg {
     Search(u64, Result<Vec<Track>, String>),
     Preview(String, Option<DynamicImage>),
     Saved(Result<PathBuf, String>),
+    Peek(PathBuf, Option<(Tags, usize, Option<(DynamicImage, (u32, u32))>)>),
     Best(String, Result<(Vec<u8>, DynamicImage), String>),
 }
 
@@ -121,6 +122,15 @@ pub struct Compare {
     pub cover_err: Option<String>,
 }
 
+/// What the browser's side panel shows for the song under the cursor.
+pub struct Peek {
+    pub path: PathBuf,
+    pub tags: Tags,
+    pub cover_len: usize,
+    pub dims: Option<(u32, u32)>,
+    pub proto: Option<StatefulProtocol>,
+}
+
 pub struct App {
     pub spotify: Arc<Spotify>,
     pub picker: Picker,
@@ -144,6 +154,8 @@ pub struct App {
     pub previews: HashMap<String, StatefulProtocol>,
     pending: HashSet<String>,
 
+    pub peek: Option<Peek>,
+    peek_pending: Option<PathBuf>,
     pub cmp: Option<Compare>,
     pub status: Option<(String, bool)>,
     pub tick: usize,
@@ -161,6 +173,7 @@ impl App {
             query: Input::default(), focus: Focus::Input, results: vec![], list: ListState::default(),
             searching: false, search_seq: 0, searched: false,
             previews: HashMap::new(), pending: HashSet::new(),
+            peek: None, peek_pending: None,
             cmp: None, status: None, tick: 0, quit: false,
         }
     }
@@ -192,6 +205,7 @@ impl App {
                         let name = file_name(Some(&new_path));
                         self.path = Some(new_path);
                         self.cmp = None;
+                        self.peek = None;
                         self.screen = Screen::Browser;
                         self.br.reload(Some(name.clone()));
                         self.ok(format!("Saved ✓  {name}"));
@@ -201,6 +215,13 @@ impl App {
                         self.err(format!("Write failed: {e}"));
                     }
                 },
+                Msg::Peek(path, r) => {
+                    self.peek_pending = None;
+                    let (tags, cover_len, img) = r.unwrap_or_default();
+                    let dims = img.as_ref().map(|(_, d)| *d);
+                    let proto = img.map(|(i, _)| self.picker.new_resize_protocol(i));
+                    self.peek = Some(Peek { path, tags, cover_len, dims, proto });
+                }
                 Msg::Search(..) => {}
                 Msg::Preview(url, img) => {
                     self.pending.remove(&url);
@@ -221,6 +242,26 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Keep the clean layout's side panel on the song under the cursor.
+    /// One read in flight at a time, always for the latest selection.
+    pub fn update_peek(&mut self) {
+        if self.screen != Screen::Browser || self.br.layout != crate::browser::Layout::Clean || self.peek_pending.is_some() { return; }
+        let Some(e) = self.br.selected().filter(|e| e.audio) else { return };
+        if self.peek.as_ref().is_some_and(|p| p.path == e.path) { return; }
+        let path = e.path.clone();
+        self.peek_pending = Some(path.clone());
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let r = tags::read(&path).ok().map(|mut t| {
+                let len = t.cover.as_ref().map_or(0, |c| c.len());
+                let img = t.cover.take().and_then(|b| image::load_from_memory(&b).ok())
+                    .map(|i| { let d = (i.width(), i.height()); (i.thumbnail(800, 800), d) });
+                (t, len, img)
+            });
+            let _ = tx.send(Msg::Peek(path, r));
+        });
     }
 
     pub fn selected_track(&self) -> Option<&Track> {
@@ -254,6 +295,8 @@ impl App {
 
     fn key_browser(&mut self, k: KeyEvent) {
         self.status = None;
+        // a refresh means tags may have changed on disk
+        if matches!(k.code, KeyCode::Char('u') | KeyCode::Char('r')) { self.peek = None; }
         match self.br.key(k) {
             Ev::None => {}
             Ev::Quit => self.quit = true,
@@ -264,6 +307,7 @@ impl App {
     }
 
     fn back_to_browser(&mut self) {
+        self.peek = None;
         self.status = None;
         self.screen = Screen::Browser;
         self.br.reload(None);
