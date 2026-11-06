@@ -33,6 +33,13 @@ fn title(s: &str, active: bool) -> Line<'static> {
     ])
 }
 
+/// Scroll so the selected row sits in the middle of the viewport when possible.
+fn center_selected(st: &mut ratatui::widgets::ListState, len: usize, height: usize) {
+    let Some(sel) = st.selected() else { return };
+    let off = sel.saturating_sub(height / 2).min(len.saturating_sub(height));
+    *st.offset_mut() = off;
+}
+
 fn trunc(s: &str, w: usize) -> String {
     if s.chars().count() <= w { return s.to_string(); }
     let mut o: String = s.chars().take(w.saturating_sub(1)).collect();
@@ -192,6 +199,7 @@ fn browser(f: &mut Frame, area: Rect, app: &mut App) {
                 Span::styled(format!("{} ", br.sort.label().split("  ").next().unwrap_or("")), Style::new().fg(MUTED)),
             ]).right_aligned());
             let list = List::new(items).block(block).highlight_style(Style::new().bg(SEL_BG).bold()).highlight_symbol("▍");
+            center_selected(&mut br.list, br.visible.len(), list_area.height.saturating_sub(2) as usize);
             f.render_stateful_widget(list, list_area, &mut br.list);
         }
         BrowserLayout::Clean => {
@@ -227,6 +235,7 @@ fn browser(f: &mut Frame, area: Rect, app: &mut App) {
                 }).collect()
             };
             let list = List::new(items).highlight_style(Style::new().bg(SEL_BG).bold());
+            center_selected(&mut br.list, br.visible.len(), area.height as usize);
             f.render_stateful_widget(list, area, &mut br.list);
             if let Some(side) = side {
                 let sel = br.selected().map(|e| (e.path.clone(), e.name.clone(), e.is_dir, e.audio, e.size));
